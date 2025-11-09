@@ -16,6 +16,9 @@ venv/
 # *.csv
 # *.parquet
 
+# Large data files
+loan_performance_enhanced.csv
+
 # OS
 .DS_Store
 Thumbs.db

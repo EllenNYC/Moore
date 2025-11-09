@@ -2,7 +2,7 @@
 """
 Cashflow Projection Using Hybrid Transition Model
 - Regression for Current → D30 and Current → Prepay
-- Empirical FICO x Age matrices for other transitions
+- Empirical Program x Term matrices for other transitions
 """
 
 import pandas as pd
@@ -30,63 +30,117 @@ scaler_d30 = models['scaler_d30']
 model_prepay = models['model_prepay']
 scaler_prepay = models['scaler_prepay']
 transition_matrices = models['transition_matrices']
-fico_bins = models['fico_bins']
-fico_labels = models['fico_labels']
-age_bins = models['age_bins']
-age_labels = models['age_labels']
-feature_cols = models['feature_cols']
-numeric_features = models['numeric_features']
+programs = models['programs']
+term_buckets = models['term_buckets']
+feature_cols_d30 = models['feature_cols_d30']
+feature_cols_prepay = models['feature_cols_prepay']
+numeric_features_d30 = models['numeric_features_d30']
+numeric_features_prepay = models['numeric_features_prepay']
 
 print(f"  Loaded regression models (AUC D30: {models['auc_d30']:.3f}, Prepay: {models['auc_prepay']:.3f})")
-print(f"  Loaded {len(transition_matrices)} empirical matrices")
+print(f"  Loaded {len(transition_matrices)} empirical matrices (Program x Term)")
+print(f"  Programs: {programs}, Term buckets: {len(term_buckets)}")
 
-# Load loan data
-loan_tape = pd.read_csv('loan tape - moore v1.0.csv')
-loan_tape.columns = loan_tape.columns.str.strip()
-loan_tape['mdr'] = pd.to_numeric(loan_tape['mdr'].str.rstrip('%'), errors='coerce') / 100
-loan_tape['int_rate'] = pd.to_numeric(loan_tape['int_rate'].str.rstrip('%'), errors='coerce') / 100
-loan_tape['approved_amount'] = pd.to_numeric(loan_tape['approved_amount'].str.replace('$', '').str.replace(',', ''), errors='coerce')
+# Load loan data from enhanced dataset
+print("  Loading loan_performance_enhanced.csv...")
+loan_perf = pd.read_csv('loan_performance_enhanced.csv')
+loan_perf['report_date'] = pd.to_datetime(loan_perf['report_date'])
+loan_perf['disbursement_d'] = pd.to_datetime(loan_perf['disbursement_d'])
+
+# Get the most recent snapshot of each loan for portfolio projection
+loan_tape_enhanced = loan_perf.sort_values('report_date').groupby('display_id').last().reset_index()
+
+# Load original loan tape for int_rate and mdr
+print("  Loading original loan tape for interest rates...")
+loan_tape_orig = pd.read_csv('loan tape - moore v1.0.csv')
+loan_tape_orig.columns = loan_tape_orig.columns.str.strip()
+loan_tape_orig['mdr'] = pd.to_numeric(loan_tape_orig['mdr'].str.rstrip('%'), errors='coerce') / 100
+loan_tape_orig['int_rate'] = pd.to_numeric(loan_tape_orig['int_rate'].str.rstrip('%'), errors='coerce') / 100
+
+# Merge enhanced data with original tape to get int_rate and mdr
+loan_tape = loan_tape_enhanced.merge(
+    loan_tape_orig[['display_id', 'int_rate', 'mdr']],
+    on='display_id',
+    how='left'
+)
+
+print(f"  Loaded {len(loan_tape):,} unique loans from enhanced dataset")
 
 # ============================================================================
 # 2. HYBRID CASHFLOW PROJECTION FUNCTION
 # ============================================================================
 
 def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, scaler_prepay,
-                             transition_matrices, fico_bins, fico_labels, age_bins, age_labels,
-                             feature_cols, numeric_features,
+                             transition_matrices, programs, term_buckets,
+                             feature_cols_d30, feature_cols_prepay,
+                             numeric_features_d30, numeric_features_prepay,
                              recovery_rate=0.15, months=60, stress_d30_mult=1.0, stress_co_mult=1.0):
     """
     Project cashflows using hybrid model:
-    - Regression for Current → D30 and Current → Prepay
-    - Empirical matrices for delinquency transitions
+    - Regression for Current → D30 (full features) and Current → Prepay (simplified features)
+    - Empirical Program x Term matrices for delinquency transitions
     """
 
     n_loans = len(portfolio_df)
     cashflows = []
 
-    # Initialize
-    balances = portfolio_df['approved_amount'].values.copy()
+    # Initialize - use current UPB as starting balance
+    balances = portfolio_df['upb'].values.copy()
     monthly_rates = portfolio_df['int_rate'].values / 12
     terms = portfolio_df['loan_term'].values
     fico_scores = portfolio_df['fico_score'].values
+    original_amounts = portfolio_df['approved_amount'].values
 
-    # Calculate monthly payments
+    # Calculate monthly payments based on original amount
     monthly_payments = np.zeros(n_loans)
     for i in range(n_loans):
         if monthly_rates[i] > 0 and terms[i] > 0:
             r = monthly_rates[i]
             n = terms[i]
-            monthly_payments[i] = balances[i] * (r * (1 + r)**n) / ((1 + r)**n - 1)
+            # Payment based on original amount
+            monthly_payments[i] = original_amounts[i] * (r * (1 + r)**n) / ((1 + r)**n - 1)
         else:
             monthly_payments[i] = balances[i] / max(terms[i], 1)
 
-    # All loans start CURRENT
-    states = np.array(['CURRENT'] * n_loans)
-    loan_ages = np.zeros(n_loans)  # Age in months
+    # Initialize states from current delinquency status
+    # Map delinquency_bucket to state
+    state_mapping = {
+        'CURRENT': 'CURRENT',
+        '1-30 DPD': 'D1_29',
+        '31-60 DPD': 'D30_59',
+        '61-90 DPD': 'D60_89',
+        '91-120 DPD': 'D90_119',
+        '120+ DPD': 'D120_PLUS',
+        'PAID OFF': 'PAID_OFF',
+        'CHARGED OFF': 'CHARGED_OFF',
+        'SATISFIED': 'PAID_OFF',
+        'WRITTEN OFF': 'CHARGED_OFF'
+    }
 
-    # FICO and Age buckets for each loan
-    fico_buckets = pd.cut(fico_scores, bins=fico_bins, labels=fico_labels)
-    fico_buckets = fico_buckets.astype(str)
+    states = portfolio_df['delinquency_bucket'].map(state_mapping).fillna('CURRENT').values
+
+    # Use current loan age
+    loan_ages = portfolio_df['loan_age_months'].values.copy()
+
+    # Program and Term buckets for each loan
+    loan_programs = portfolio_df['program'].values
+
+    # Categorize terms into buckets
+    def categorize_term(term):
+        if term <= 3:
+            return '0-3m'
+        elif term <= 6:
+            return '4-6m'
+        elif term <= 12:
+            return '7-12m'
+        elif term <= 18:
+            return '13-18m'
+        elif term <= 24:
+            return '19-24m'
+        else:
+            return '24m+'
+
+    term_bucket_vals = np.array([categorize_term(t) for t in terms])
 
     for month in range(months):
         # Active loans (not charged-off or paid-off)
@@ -103,10 +157,6 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
                                       np.minimum(monthly_payments - interest, balances),
                                       0)
 
-        # Determine age buckets
-        age_buckets = pd.cut(loan_ages, bins=age_bins, labels=age_labels, right=False)
-        age_buckets = age_buckets.astype(str)
-
         # Transition loans
         new_states = states.copy()
 
@@ -119,32 +169,52 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
             # Prepare features for regression
             current_indices = np.where(current_mask)[0]
 
-            # Build feature matrix
-            current_features = pd.DataFrame({
+            # Build feature matrix for D30+ model (full features)
+            d30_features = pd.DataFrame({
                 'fico_score': fico_scores[current_indices],
                 'approved_amount': portfolio_df['approved_amount'].values[current_indices],
                 'loan_term': portfolio_df['loan_term'].values[current_indices],
-                'int_rate': portfolio_df['int_rate'].values[current_indices],
-                'mdr': portfolio_df['mdr'].values[current_indices],
+                'loan_age_months': loan_ages[current_indices],
+                'upb': balances[current_indices],
+                'paid_principal': portfolio_df['paid_principal'].values[current_indices],
+                'paid_interest': portfolio_df['paid_interest'].values[current_indices],
+                'ever_D30': portfolio_df['ever_D30'].values[current_indices],
+                'ever_D60': portfolio_df['ever_D60'].values[current_indices],
+                'ever_D90': portfolio_df['ever_D90'].values[current_indices]
+            })
+
+            # Add program dummies for D30+ model
+            program_vals = portfolio_df['program'].values[current_indices]
+            for prog in ['P2', 'P3']:
+                d30_features[f'program_{prog}'] = (program_vals == prog).astype(int)
+
+            # Ensure all D30+ feature columns exist
+            for col in feature_cols_d30:
+                if col not in d30_features.columns:
+                    d30_features[col] = 0
+            d30_features = d30_features[feature_cols_d30]
+
+            # Build feature matrix for Prepay model (simplified: program, term, age only)
+            prepay_features = pd.DataFrame({
+                'loan_term': portfolio_df['loan_term'].values[current_indices],
                 'loan_age_months': loan_ages[current_indices]
             })
 
-            # Add program dummies
-            program_vals = portfolio_df['program'].values[current_indices]
+            # Add program dummies for Prepay model
             for prog in ['P2', 'P3']:
-                current_features[f'program_{prog}'] = (program_vals == prog).astype(int)
+                prepay_features[f'program_{prog}'] = (program_vals == prog).astype(int)
 
-            # Ensure all feature columns exist
-            for col in feature_cols:
-                if col not in current_features.columns:
-                    current_features[col] = 0
-            current_features = current_features[feature_cols]
+            # Ensure all Prepay feature columns exist
+            for col in feature_cols_prepay:
+                if col not in prepay_features.columns:
+                    prepay_features[col] = 0
+            prepay_features = prepay_features[feature_cols_prepay]
 
             # Predict probabilities
-            X_scaled_d30 = scaler_d30.transform(current_features)
+            X_scaled_d30 = scaler_d30.transform(d30_features)
             prob_d30 = model_d30.predict_proba(X_scaled_d30)[:, 1] * stress_d30_mult
 
-            X_scaled_prepay = scaler_prepay.transform(current_features)
+            X_scaled_prepay = scaler_prepay.transform(prepay_features)
             prob_prepay = model_prepay.predict_proba(X_scaled_prepay)[:, 1]
 
             # Determine outcomes
@@ -180,17 +250,17 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
             trans_matrix = transition_matrices[delq_state]
 
             for idx in state_indices:
-                fico_bucket = fico_buckets[idx]
-                age_bucket = age_buckets[idx]
+                program = loan_programs[idx]
+                term_bucket = term_bucket_vals[idx]
 
                 # Lookup transition probabilities
-                matrix_key = (fico_bucket, age_bucket)
+                matrix_key = (program, term_bucket)
 
                 if matrix_key in trans_matrix:
                     trans_probs = trans_matrix[matrix_key]
                 else:
-                    # Fallback to FICO-only
-                    fallback_keys = [k for k in trans_matrix.keys() if k[0] == fico_bucket]
+                    # Fallback to Program-only (average across all terms for this program)
+                    fallback_keys = [k for k in trans_matrix.keys() if k[0] == program]
                     if fallback_keys:
                         trans_probs = trans_matrix[fallback_keys[0]]
                     else:
@@ -262,6 +332,7 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
             'chargedoff_count': (states == 'CHARGED_OFF').sum(),
             'paidoff_count': (states == 'PAID_OFF').sum()
         })
+    # print(pd.DataFrame(cashflows))
 
     return pd.DataFrame(cashflows)
 
@@ -328,12 +399,32 @@ print("\n2. Running scenario analysis...")
 
 sample_size = min(10000, len(loan_tape))
 np.random.seed(42)
-portfolio_sample = loan_tape.dropna(subset=['approved_amount', 'int_rate', 'loan_term', 'fico_score', 'mdr', 'program']).sample(
-    n=sample_size, random_state=42
+
+# Filter for active loans only (exclude already charged off or paid off)
+active_loans = loan_tape[~loan_tape['delinquency_bucket'].isin(['PAID OFF', 'CHARGED OFF', 'SATISFIED', 'WRITTEN OFF'])]
+required_cols = ['approved_amount', 'int_rate', 'loan_term', 'fico_score', 'program',
+                 'upb', 'paid_principal', 'paid_interest', 'ever_D30', 'ever_D60', 'ever_D90',
+                 'delinquency_bucket', 'loan_age_months']
+
+# Check for delinquency_bucket column
+if 'delinquency_bucket' not in active_loans.columns:
+    print("  Warning: delinquency_bucket not found, using loan_status instead")
+    # Map loan_status to delinquency_bucket
+    active_loans = loan_tape[~loan_tape['loan_status'].isin(['PAID OFF', 'CHARGED OFF', 'SATISFIED', 'WRITTEN OFF'])]
+
+portfolio_sample = active_loans.dropna(subset=required_cols).sample(
+    n=min(sample_size, len(active_loans)), random_state=42
 )
 
-initial_value = portfolio_sample['approved_amount'].sum()
-print(f"\n  Portfolio: {sample_size:,} loans, ${initial_value:,.0f}")
+# Use current UPB as initial value (not original approved amount)
+# assume we pay 1% upfront fees
+price_percent = 1-portfolio_sample['mdr']+0.01
+initial_value = (portfolio_sample['upb'] * price_percent).sum()
+
+
+print(f"\n  Portfolio: {len(portfolio_sample):,} active loans")
+print(f"  Current UPB: ${initial_value:,.0f}")
+print(f"  Original Amount: ${portfolio_sample['approved_amount'].sum():,.0f}")
 
 scenarios = {
     'Base Case': {'stress_d30': 1.0, 'stress_co': 1.0, 'recovery': 0.15},
@@ -351,8 +442,9 @@ for scenario_name, params in scenarios.items():
     np.random.seed(42)
     cf = project_cashflows_hybrid(
         portfolio_sample, model_d30, scaler_d30, model_prepay, scaler_prepay,
-        transition_matrices, fico_bins, fico_labels, age_bins, age_labels,
-        feature_cols, numeric_features,
+        transition_matrices, programs, term_buckets,
+        feature_cols_d30, feature_cols_prepay,
+        numeric_features_d30, numeric_features_prepay,
         recovery_rate=params['recovery'],
         stress_d30_mult=params['stress_d30'],
         stress_co_mult=params['stress_co']
@@ -361,7 +453,8 @@ for scenario_name, params in scenarios.items():
     cashflow_results[scenario_name] = cf
 
     unlev = calculate_returns(cf, initial_value, 0.0, 0.0)
-    lev = calculate_returns(cf, initial_value, 0.85, 0.065)
+    # assume cost_of_debt = 3.6%+1.5% = 5.1%
+    lev = calculate_returns(cf, initial_value, 0.85, 0.051)
 
     results[scenario_name] = {'unlevered': unlev, 'levered': lev}
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Create visualizations for Moore Capital investment memo
+Updated to use hybrid_cashflow_results.pkl from hybrid transition model
 """
 
 import pandas as pd
@@ -9,12 +10,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pickle
 
-# Load results
-with open('analysis_results_v2.pkl', 'rb') as f:
+# Load results from hybrid cashflow model
+print("Loading hybrid cashflow results...")
+with open('hybrid_cashflow_results.pkl', 'rb') as f:
     data = pickle.load(f)
 
 results = data['results']
 cashflows = data['cashflows']
+print(f"Loaded {len(results)} scenarios")
 
 # Set style
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -149,7 +152,7 @@ for i in range(5):
 
 ax7.set_title('Unlevered Returns Summary', fontweight='bold', fontsize=12, pad=20)
 
-fig.suptitle('Moore Capital Consumer Credit Portfolio Analysis',
+fig.suptitle('Moore Capital Consumer Credit Portfolio Analysis - Hybrid Transition Model',
              fontsize=16, fontweight='bold', y=0.995)
 
 plt.savefig('investment_analysis_charts.png', dpi=300, bbox_inches='tight')

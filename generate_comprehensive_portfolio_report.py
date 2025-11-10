@@ -206,22 +206,6 @@ plt.tight_layout()
 plt.savefig('roll_rate_heatmap.png', dpi=150, bbox_inches='tight')
 plt.close()
 
-# Calculate roll rates by program for Appendix
-roll_rates_by_program = {}
-for program in ['P1', 'P2', 'P3']:
-    prog_data = roll_rate_data[roll_rate_data['program'] == program]
-    if len(prog_data) > 0:
-        # Calculate UPB-weighted roll rate matrix for this program
-        roll_rate_upb_prog = pd.crosstab(
-            prog_data['delinquency_bucket'],
-            prog_data['next_delinquency_bucket'],
-            values=prog_data['upb'],
-            aggfunc='sum'
-        )
-        row_totals_upb_prog = roll_rate_upb_prog.sum(axis=1)
-        roll_rate_matrix_prog = roll_rate_upb_prog.div(row_totals_upb_prog, axis=0) * 100
-        roll_rates_by_program[program] = roll_rate_matrix_prog
-
 # 1.5 Generate default rate by loan term and program (from cell 32 of data_exploration.ipynb)
 # Get final status for each loan - calculate terminal event
 df_sorted = df.sort_values(['display_id', 'report_date']).copy()
@@ -925,42 +909,6 @@ html_content += f"""
             <li><strong>D90-119 → Charge-off:</strong> 79.7%</li>
             <li><strong>D120+ → Charge-off:</strong> 86.0%</li>
         </ul>
-
-        <p><strong>Key Roll Rates by Program:</strong></p>
-        <table style="width: 100%; margin: 20px 0;">
-            <tr>
-                <th>Transition</th>
-                <th>P1 (Prime)</th>
-                <th>P2 (Near-Prime)</th>
-                <th>P3 (Subprime)</th>
-            </tr>
-"""
-
-# Add program-specific roll rates to the table
-roll_rate_rows = [
-    ('D1-29 → Current (Cure)', '1-29 DPD', 'CURRENT'),
-    ('D1-29 → D30-59 (Roll)', '1-29 DPD', '30-59 DPD'),
-    ('D1-29 → Stay D1-29', '1-29 DPD', '1-29 DPD'),
-    ('D1-29 → Payoff', '1-29 DPD', 'Paid_off'),
-    ('D90-119 → Charge-off', '90-119 DPD', 'Default'),
-    ('D120+ → Charge-off', '120+ DPD', 'Default'),
-]
-
-for label, from_state, to_state in roll_rate_rows:
-    html_content += f"            <tr>\n                <td><strong>{label}</strong></td>\n"
-    for program in ['P1', 'P2', 'P3']:
-        if program in roll_rates_by_program:
-            prog_matrix = roll_rates_by_program[program]
-            if from_state in prog_matrix.index and to_state in prog_matrix.columns:
-                value = prog_matrix.loc[from_state, to_state]
-                html_content += f"                <td>{value:.1f}%</td>\n"
-            else:
-                html_content += "                <td>—</td>\n"
-        else:
-            html_content += "                <td>—</td>\n"
-    html_content += "            </tr>\n"
-
-html_content += """        </table>
 
         <h3>A.5 Detailed Performance by Program and Term</h3>
         <div class="chart-container">

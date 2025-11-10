@@ -479,6 +479,7 @@ html_content = f"""
 
             <h4>Loan Performance Dataset Issues:</h4>
             <ul>
+                <li><strong>Limited Historical Period:</strong> Dataset covers performance only through October 2023, providing relatively short observation window for loans originated in 2021-2023. This limits the ability to observe full loan lifecycle performance for longer-term loans and may introduce right-censoring bias in default rate estimates.</li>
                 <li><strong>Missing Values:</strong> The <code>charge_off_date</code> field has 988,390 missing values out of 1,045,858 records (94.5%), which is expected as it should only be populated for charged-off loans (57,468 records).</li>
                 <li><strong>Outliers Detected:</strong> Some loans show <code>days_delinquent</code> values exceeding 500 days, which appears abnormally high and may indicate data quality issues or exceptional cases requiring investigation.</li>
                 <li><strong>Negative Values:</strong> Some records show negative values for <code>paid_principal</code> (minimum: -$105.23) and <code>paid_interest</code> (minimum: -$6.47), likely representing payment adjustments or reversals.</li>

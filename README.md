@@ -24,18 +24,35 @@ The seasoned portfolio generates acceptable returns (8.2% unlevered IRR base cas
 
 ---
 
-## Latest Updates (November 9, 2025)
+## Latest Updates (November 10, 2025)
 
-### Hybrid Transition Model Enhancements
+### Comprehensive HTML Report & Model Improvements
 
-1. **Age Bucket Features**: Loan age converted to spline buckets (0-3m, 4-6m, 7-12m, 13-18m, 19-24m, 24m+) as dummy variables for D1-29 model to capture non-linear risk patterns
-2. **D1-29 Early Delinquency Model**: Switched from D30+ to D1-29 (1-30 DPD) to capture early warning signals with high cure rates (27% to CURRENT)
-3. **Program × Term Segmentation**: Replaced FICO × Age matrices with Product Program × Loan Term empirical matrices for better actionability
-4. **Enhanced Dataset**: Now uses `loan_performance_enhanced.csv` with pre-computed features (ever_D30, ever_D60, ever_D90, UPB, paid amounts)
-5. **Dual Feature Strategy**:
-   - D1-29 model uses full feature set (6 numeric + program + age buckets)
-   - Prepay model uses simplified features (program, term, continuous age only)
-6. **Loan Age X-Axis**: All visualizations now show performance by loan age rather than report date
+1. **Comprehensive HTML Report**: Generated professional investment memorandum (`Moore_Capital_Portfolio_Analysis_Report.html`) with:
+   - Complete data quality assessment and portfolio statistics
+   - Portfolio trends analysis with credit quality evolution charts
+   - Historical roll rate matrices (UPB-weighted transition probabilities)
+   - Default rate analysis by loan term and program (vintage-complete cohorts)
+   - Full methodology documentation with model validation charts
+   - Cashflow projections and scenario analysis
+   - Executive summary with key findings
+
+2. **UPB Bucket Features for Payoff Model**: Replaced time-to-maturity features with UPB (unpaid principal balance) buckets:
+   - Achieved **32% AUC improvement** (0.614 → 0.933) for Payoff model
+   - 5 UPB buckets: 0-1k, 1-2.5k (baseline), 2.5-5k, 5-7.5k, 7.5k+
+   - Very low balance loans (<$1k) show strongest payoff predictor (+3.52 coefficient)
+
+3. **Vintage-Complete Default Rate Analysis**: Section 1.5 now shows default rates for loans with sufficient time to mature:
+   - Filters for loans where time elapsed ≥ loan term by October 2023 cutoff
+   - Eliminates right-censoring bias for unbiased default rate estimates
+   - Shows cumulative default rates by term and program from cell 32 of data exploration
+
+4. **Program × Term Segmentation**: Maintained Product Program × Loan Term empirical matrices for actionable insights aligned with business structure
+
+5. **D1-29 Early Delinquency Model**: Continues to capture 1-30 DPD with 28.6% cure rate for superior loss forecasting
+
+6. **Enhanced Dataset**: Uses `loan_performance_enhanced.csv` with pre-computed features (ever_D30, delinquency buckets, UPB, paid amounts)
+
 7. **Realistic Portfolio State**: Cashflow projections start from actual current UPB and delinquency states
 
 ---

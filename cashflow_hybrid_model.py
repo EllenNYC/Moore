@@ -465,10 +465,18 @@ print("\n2. Running scenario analysis...")
 sample_size = min(10000, len(loan_tape))
 np.random.seed(42)
 
-# Filter for active loans only (exclude already charged off or paid off)
-# active loans should be those upb>0 and as of Oct 2023
-# active_loans = loan_tape[~loan_tape['delinquency_bucket'].isin(['PAID OFF', 'CHARGED OFF', 'SATISFIED', 'WRITTEN_OFF'])]
-active_loans = loan_tape[(loan_tape['upb'] > 100) & (loan_tape['report_date'] >= '2023-10-01')]
+# Filter for 2023Q3 originations (July-September 2023) - vintage cohort analysis
+# Get loans originated in 2023Q3 and still active as of Oct 2023
+q3_2023_start = pd.to_datetime('2023-07-01')
+q3_2023_end = pd.to_datetime('2023-09-30')
+oct_2023 = pd.to_datetime('2023-10-01')
+
+active_loans = loan_tape[
+    (loan_tape['disbursement_d'] >= q3_2023_start) &
+    (loan_tape['disbursement_d'] <= q3_2023_end) &
+    (loan_tape['upb'] > 100) &
+    (loan_tape['report_date'] >= oct_2023)
+]
 required_cols = ['approved_amount', 'int_rate', 'loan_term', 'fico_score', 'program',
                  'upb', 'paid_principal', 'paid_interest', 'ever_D30', 'ever_D60', 'ever_D90',
                  'delinquency_bucket', 'loan_age_months']
@@ -489,7 +497,8 @@ price_percent = 1-portfolio_sample['mdr']+0.01
 initial_value = (portfolio_sample['upb'] * price_percent).sum()
 
 
-print(f"\n  Portfolio: {len(portfolio_sample):,} active loans")
+print(f"\n  Portfolio: {len(portfolio_sample):,} active loans (2023Q3 originations)")
+print(f"  Origination Date Range: {portfolio_sample['disbursement_d'].min().strftime('%Y-%m-%d')} to {portfolio_sample['disbursement_d'].max().strftime('%Y-%m-%d')}")
 print(f"  Current UPB: ${initial_value:,.0f}")
 print(f"  Original Amount: ${portfolio_sample['approved_amount'].sum():,.0f}")
 

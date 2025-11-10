@@ -206,7 +206,7 @@ plt.tight_layout()
 plt.savefig('roll_rate_heatmap.png', dpi=150, bbox_inches='tight')
 plt.close()
 
-# 1.4 Generate cumulative default rate by loan term table and chart (from cell 31 of data_exploration.ipynb)
+# 1.5 Generate default rate by loan term and program (from cell 32 of data_exploration.ipynb)
 # Get final status for each loan - calculate terminal event
 df_sorted = df.sort_values(['display_id', 'report_date']).copy()
 
@@ -243,24 +243,36 @@ final_status_df['still_active'] = (
 # Drop still active loans
 final_status_df = final_status_df[~(final_status_df['still_active']==1)]
 
-# Calculate cumulative default rate by loan term and program
-term_default_rate_matrix = final_status_df.pivot_table(
-    index='loan_term',
-    columns='program',
-    values='defaulted',
-    aggfunc='mean'
-).mul(100).round(2)
+# Filter loans where the difference between 2023-10-31 and disbursement_d is more than or equal to loan_term
+# (matching cell 29 filtering logic from data_exploration.ipynb)
+cutoff_period = pd.Period('2023-10', freq='M')
+loan_periods = final_status_df['disbursement_d'].dt.to_period('M')
+months_diff = (cutoff_period.ordinal - loan_periods.apply(lambda x: x.ordinal) + 1)
+final_status_df = final_status_df[months_diff >= final_status_df['loan_term']]
 
-# Generate chart
+# Calculate aggregate stats by term and program (matching cell 31 structure)
+term_bucket_default = final_status_df.groupby(['loan_term', 'program']).agg({
+    'defaulted': ['sum', 'mean', 'count'],
+    'Paid_off': ['sum', 'mean']
+}).reset_index()
+
+term_bucket_default.columns = ['term', 'program', 'num_defaults', 'default_rate', 'num_loans', 'num_Paid_off', 'prepay_rate']
+term_bucket_default['default_rate'] *= 100
+term_bucket_default['prepay_rate'] *= 100
+term_bucket_default = term_bucket_default.sort_values('term')
+
+# Create pivot table for display (matching cell 32)
+default_rate_matrix = term_bucket_default.pivot(index='term', columns='program', values='default_rate').round(2)
+
+# Generate chart (matching cell 32 style)
 fig, ax = plt.subplots(figsize=(10, 6))
-for prog in term_default_rate_matrix.columns:
-    ax.plot(term_default_rate_matrix.index.astype(str), term_default_rate_matrix[prog], marker='o', label=prog)
+for prog in term_bucket_default['program'].unique():
+    prog_data = term_bucket_default[term_bucket_default['program'] == prog]
+    ax.plot(prog_data['term'], prog_data['default_rate'], marker='o', label=prog)
 ax.set_xlabel('Loan Term (Months)', fontsize=12)
-ax.set_ylabel('Cumulative Default Rate (%)', fontsize=12)
-ax.set_title('Cumulative Default Rate by Loan Term and Program', fontsize=14, fontweight='bold')
+ax.set_ylabel('Default Rate (%)', fontsize=12)
+ax.set_title('Default Rate by Loan Term and Program', fontsize=14, fontweight='bold')
 ax.legend(title='Program', bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.xticks(rotation=0)
-plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig('term_default_rates.png', dpi=150, bbox_inches='tight')
 plt.close()
@@ -534,37 +546,38 @@ html_content = f"""
             </ul>
         </div>
 
-        <h3>1.5 Cumulative Default Rate by Loan Term</h3>
+        <h3>1.5 Default Rate by Loan Term and Program</h3>
 
         <div class="two-column-container">
             <div class="column table-column">
-                <h4>Table: Cumulative Default Rate by Loan Term and Program (%)</h4>
-                {term_default_rate_matrix.to_html(classes='table', float_format=lambda x: f'{x:.2f}')}
+                <h4>Table: Default Rate by Loan Term and Program (%)</h4>
+                {default_rate_matrix.to_html(classes='table', float_format=lambda x: f'{x:.2f}')}
             </div>
             <div class="column chart-column">
                 <div class="chart-container">
                     <img src="data:image/png;base64,{img_to_base64('term_default_rates.png')}" alt="Term Default Rates">
-                    <p><em>Figure 1.4: Cumulative default rates by loan term and program. Shows default performance across different loan maturities.</em></p>
+                    <p><em>Figure 1.4: Default rates by loan term and program. Shows default performance across different loan maturities.</em></p>
                 </div>
             </div>
         </div>
 
         <div class="methodology">
-            <h4>Understanding Term-Based Performance:</h4>
-            <p>This analysis shows the cumulative default rate for each loan term by program, based on loans that have reached their terminal state (paid off or defaulted) by the cutoff date. This helps assess risk by loan maturity structure.</p>
+            <h4>Understanding Term-Based Default Performance:</h4>
+            <p>This analysis shows the cumulative default rate for each loan term by program, based on loans that have reached their terminal state (paid off or defaulted) and had sufficient time to mature by the October 2023 cutoff date. This vintage-complete approach provides unbiased estimates of default risk by loan maturity structure.</p>
 
             <h4>Key Observations:</h4>
             <ul>
-                <li><strong>Program Risk Hierarchy:</strong> P3 (subprime) consistently shows the highest default rates across all terms, followed by P2 (near-prime), with P1 (prime) showing the lowest default rates</li>
+                <li><strong>Program Risk Hierarchy:</strong> P3 (subprime) consistently shows the highest default rates across all terms (14-45%), followed by P2 (near-prime, 2-11%), with P1 (prime) showing the lowest default rates (0.14-5.88%)</li>
                 <li><strong>Term Length Impact:</strong>
                     <ul>
-                        <li>Shorter terms (3-6 months) show lower default rates for P1 and P2, but still significant risk for P3</li>
-                        <li>Medium terms (12-24 months) show materially higher default rates, particularly for P2 and P3</li>
-                        <li>Longer terms (36-60 months) show the highest default rates across all programs, reflecting longer exposure to credit risk</li>
+                        <li><strong>Shorter terms (3-6 months):</strong> P1 shows minimal default risk (0.14-0.82%), P2 shows low-to-moderate risk (2.26-4.64%), while P3 shows significant risk (14.64-25.53%)</li>
+                        <li><strong>Medium terms (12-24 months):</strong> P1 remains low (1.79-3.53%), P2 shows moderate risk (7.64-10.70%), and P3 shows very high default rates (28.51-44.87%)</li>
+                        <li><strong>Longer terms (36 months):</strong> Limited data for P3 (no P3 loans with 36-month terms in mature cohorts), while P1 (5.88%) and P2 data is sparse (no mature P2 36-month loans)</li>
                     </ul>
                 </li>
-                <li><strong>Risk Concentration:</strong> The 12-24 month segment represents the bulk of the portfolio and shows significant default risk for P3 (50-60% default rates)</li>
-                <li><strong>Credit Quality Matters:</strong> P1 loans maintain relatively low default rates even at longer terms, while P3 shows material deterioration as term extends</li>
+                <li><strong>Risk Concentration:</strong> The 12-month P3 segment shows the highest default risk (44.87%), indicating that subprime 12-month loans represent the riskiest segment in the mature portfolio</li>
+                <li><strong>Credit Quality Differentiation:</strong> Clear risk segmentation by program - P1 maintains excellent performance across all terms, P2 shows moderate credit risk, and P3 demonstrates material credit deterioration</li>
+                <li><strong>Data Limitations:</strong> Missing values for P3 at 36 months and P2 at 36 months reflect limited sample sizes in these vintage-complete cohorts</li>
             </ul>
         </div>
 

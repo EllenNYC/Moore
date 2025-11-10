@@ -2,7 +2,7 @@
 """
 Hybrid Transition Model for Consumer Credit Portfolio
 - Uses loan_performance_enhanced.csv with pre-computed features
-- Regression for Current → D30 and Current → Prepay
+- Regression for Current → D30 and Current → Payoff
 - Empirical matrices (Program x Term) for all other transitions
 """
 
@@ -45,25 +45,20 @@ print("\n2. Creating delinquency states and transitions...")
 # Map to standardized state names
 state_mapping = {
     'CURRENT': 'CURRENT',
-    '1-30 DPD': 'D1_29',
-    '31-60 DPD': 'D30_59',
-    '61-90 DPD': 'D60_89',
-    '91-120 DPD': 'D90_119',
-    '120+ DPD': 'D120_PLUS'
+    '1-29 DPD': 'D1_29',
+    '30-59 DPD': 'D30_59',
+    '60-89 DPD': 'D60_89',
+    '90-119 DPD': 'D90_119',
+    '120+ DPD': 'D120_PLUS',
+    'Paid_off': 'PAID_OFF',
+    'Default': 'CHARGED_OFF'
 }
 
-# For terminal states, check loan_status
-def assign_state(row):
-    """Assign delinquency state"""
-    if row['loan_status'] in ['CHARGED_OFF']:
-        return 'CHARGED_OFF'
-    elif row['loan_status'] in ['PAID_OFF']:
-        return 'PAID_OFF'
-    else:
-        # Use delinquency_bucket for active loans
-        return state_mapping.get(row['delinquency_bucket'], 'CURRENT')
+# Assign state from delinquency_bucket
+df['state'] = df['delinquency_bucket'].map(state_mapping)
 
-df['state'] = df.apply(assign_state, axis=1)
+# Fill any unmapped values with CURRENT as default
+df['state'] = df['state'].fillna('CURRENT')
 
 print(f"  State distribution:")
 print(df['state'].value_counts())
@@ -84,56 +79,139 @@ print(f"  Total valid transitions: {len(transitions):,}")
 print(f"  Transition date range: {transitions['report_date'].min()} to {transitions['report_date'].max()}")
 
 # ============================================================================
-# 3. BUILD REGRESSION MODELS (CURRENT → D30 AND CURRENT → PREPAY)
+# 3. BUILD REGRESSION MODELS (CURRENT → D30 AND CURRENT → PAYOFF)
 # ============================================================================
 print("\n3. Building regression models for Current state transitions...")
 
 # Filter to transitions from CURRENT state only
 current_transitions = transitions[transitions['prev_state'] == 'CURRENT'].copy()
 
-print(f"  Current-state transitions: {len(current_transitions):,}")
+print(f"  Current-state transitions (before filtering): {len(current_transitions):,}")
+
+# IMPORTANT: Exclude transitions at or after loan maturity
+# Maturity occurs when loan_age_months >= loan_term
+# We only want to model behavior BEFORE the loan matures
+print(f"\n  Filtering out transitions at or after maturity (loan_age >= loan_term)...")
+before_filter = len(current_transitions)
+current_transitions = current_transitions[current_transitions['loan_age_months'] < current_transitions['loan_term']].copy()
+after_filter = len(current_transitions)
+print(f"  Removed {before_filter - after_filter:,} transitions at/after maturity ({(before_filter - after_filter)/before_filter*100:.1f}%)")
+
+print(f"  Current-state transitions (after filtering): {len(current_transitions):,}")
 print(f"  Next state distribution:")
 print(current_transitions['state'].value_counts())
 
 # Create outcome variables
-current_transitions['to_d30'] = current_transitions['state'].isin(
-    ['D1_29', 'D30_59', 'D60_89', 'D90_119', 'D120_PLUS']
-).astype(int)
+# Change to predict Current → D1-29 (early delinquency) instead of D30+
+current_transitions['to_d1_29'] = (current_transitions['state'] == 'D1_29').astype(int)
+# Prepay = PAID_OFF, but only if it's BEFORE maturity (which is already filtered above)
 current_transitions['to_prepay'] = (current_transitions['state'] == 'PAID_OFF').astype(int)
 current_transitions['to_chargeoff'] = (current_transitions['state'] == 'CHARGED_OFF').astype(int)
 
-print(f"\n  Outcome rates:")
-print(f"    → Delinquency (D30+): {current_transitions['to_d30'].mean()*100:.2f}%")
-print(f"    → Prepay: {current_transitions['to_prepay'].mean()*100:.2f}%")
+print(f"\n  Outcome rates (before maturity only):")
+print(f"    → D1-29 (Early Delinquency): {current_transitions['to_d1_29'].mean()*100:.2f}%")
+print(f"    → Payoff (Early Payoff): {current_transitions['to_prepay'].mean()*100:.2f}%")
 print(f"    → Direct charge-off: {current_transitions['to_chargeoff'].mean()*100:.2f}%")
 
 # Enhanced features from the dataset
-numeric_features = [
-    'fico_score',
-    'approved_amount',
-    'loan_term',
-    'loan_age_months',
-    'upb',
-    'ever_D30',  # Has loan ever been 30+ DPD before?
-    'ever_D60',  # Has loan ever been 60+ DPD before?
-    'ever_D90'   # Has loan ever been 90+ DPD before?
-]
+# Create loan age buckets for D1-29 model
+def create_age_buckets(age_months):
+    """Create loan age buckets with finer granularity in early months"""
+    if age_months <= 1:
+        return '0-1m'
+    elif age_months <= 3:
+        return '2-3m'
+    elif age_months <= 6:
+        return '4-6m'
+    elif age_months <= 12:
+        return '7-12m'
+    elif age_months <= 18:
+        return '13-18m'
+    elif age_months <= 24:
+        return '19-24m'
+    else:
+        return '24m+'
 
+current_transitions['age_bucket'] = current_transitions['loan_age_months'].apply(create_age_buckets)
+
+# Create FICO score buckets
+def create_fico_buckets(fico):
+    """Create FICO score buckets"""
+    if fico < 620:
+        return 'fico_<620'
+    elif fico < 660:
+        return 'fico_620-659'
+    elif fico < 700:
+        return 'fico_660-699'
+    elif fico < 740:
+        return 'fico_700-739'
+    else:
+        return 'fico_740+'
+
+# Create loan amount buckets
+def create_amount_buckets(amount):
+    """Create loan amount buckets"""
+    if amount <= 2000:
+        return 'amt_0-2k'
+    elif amount <= 4000:
+        return 'amt_2-4k'
+    elif amount <= 6000:
+        return 'amt_4-6k'
+    elif amount <= 8000:
+        return 'amt_6-8k'
+    else:
+        return 'amt_8k+'
+
+# Create UPB buckets (for prepay model)
+def create_upb_buckets(upb):
+    """Create UPB (unpaid principal balance) buckets"""
+    if upb <= 1000:
+        return 'upb_0-1k'
+    elif upb <= 2500:
+        return 'upb_1-2.5k'
+    elif upb <= 5000:
+        return 'upb_2.5-5k'
+    elif upb <= 7500:
+        return 'upb_5-7.5k'
+    else:
+        return 'upb_7.5k+'
+
+current_transitions['fico_bucket'] = current_transitions['fico_score'].apply(create_fico_buckets)
+current_transitions['amount_bucket'] = current_transitions['approved_amount'].apply(create_amount_buckets)
+current_transitions['upb_bucket'] = current_transitions['upb'].apply(create_upb_buckets)
+
+# No numeric features - all categorical
 # Add program dummies
 program_dummies = pd.get_dummies(current_transitions['program'], prefix='program', drop_first=True)
 
-# Combine features
-X = pd.concat([current_transitions[numeric_features], program_dummies], axis=1)
+# Add age bucket dummies (drop first to avoid multicollinearity)
+age_bucket_dummies = pd.get_dummies(current_transitions['age_bucket'], prefix='age', drop_first=True)
+
+# Add FICO bucket dummies (drop first)
+fico_bucket_dummies = pd.get_dummies(current_transitions['fico_bucket'], prefix='fico', drop_first=True)
+
+# Add amount bucket dummies (drop first)
+amount_bucket_dummies = pd.get_dummies(current_transitions['amount_bucket'], prefix='amt', drop_first=True)
+
+# Add loan term dummies (drop first)
+loan_term_dummies = pd.get_dummies(current_transitions['loan_term'], prefix='term', drop_first=True)
+
+# Add ever_D30 dummy (binary, no need to drop)
+ever_d30_dummy = current_transitions[['ever_D30']].astype(int)
+
+# Combine all dummy features
+X = pd.concat([program_dummies, age_bucket_dummies, fico_bucket_dummies,
+               amount_bucket_dummies, loan_term_dummies, ever_d30_dummy], axis=1)
 
 # ============================================================================
-# Model A: Current → D30+ (First Delinquency)
+# Model A: Current → D1-29 (Early Delinquency)
 # ============================================================================
-print("\n  Model A: Current → D30+ (First Delinquency)...")
+print("\n  Model A: Current → D1-29 (Early Delinquency)...")
 
-y_d30 = current_transitions['to_d30']
-valid_idx = X.notna().all(axis=1) & y_d30.notna()
+y_d1_29 = current_transitions['to_d1_29']
+valid_idx = X.notna().all(axis=1) & y_d1_29.notna()
 X_clean = X[valid_idx]
-y_clean = y_d30[valid_idx]
+y_clean = y_d1_29[valid_idx]
 
 print(f"    Valid observations: {len(X_clean):,}")
 print(f"    Positive class rate: {y_clean.mean()*100:.2f}%")
@@ -149,74 +227,94 @@ X_test = X_clean.loc[test_idx]
 y_train = y_clean.loc[train_idx]
 y_test = y_clean.loc[test_idx]
 
-scaler_d30 = StandardScaler()
-X_train_scaled = scaler_d30.fit_transform(X_train)
-X_test_scaled = scaler_d30.transform(X_test)
+scaler_d1_29 = StandardScaler()
+X_train_scaled = scaler_d1_29.fit_transform(X_train)
+X_test_scaled = scaler_d1_29.transform(X_test)
 
-model_d30 = LogisticRegression(random_state=42, max_iter=1000)
-model_d30.fit(X_train_scaled, y_train)
+model_d1_29 = LogisticRegression(random_state=42, max_iter=1000)
+model_d1_29.fit(X_train_scaled, y_train)
 
 # Evaluate
-y_train_pred_proba = model_d30.predict_proba(X_train_scaled)[:, 1]
-y_test_pred_proba = model_d30.predict_proba(X_test_scaled)[:, 1]
-y_pred = model_d30.predict(X_test_scaled)
-auc_d30 = roc_auc_score(y_test, y_test_pred_proba)
+y_train_pred_proba = model_d1_29.predict_proba(X_train_scaled)[:, 1]
+y_test_pred_proba = model_d1_29.predict_proba(X_test_scaled)[:, 1]
+y_pred = model_d1_29.predict(X_test_scaled)
+auc_d1_29 = roc_auc_score(y_test, y_test_pred_proba)
 
-print(f"    AUC-ROC: {auc_d30:.4f}")
+print(f"    AUC-ROC: {auc_d1_29:.4f}")
 print(f"    Test accuracy: {(y_pred == y_test).mean()*100:.2f}%")
 
 # Feature importance
 feature_cols = list(X_clean.columns)
-coefs_d30 = pd.DataFrame({
+coefs_d1_29 = pd.DataFrame({
     'Feature': feature_cols,
-    'Coefficient': model_d30.coef_[0]
+    'Coefficient': model_d1_29.coef_[0]
 }).sort_values('Coefficient', key=abs, ascending=False)
 
 print(f"\n    Top 5 features (by absolute coefficient):")
-for idx, row in coefs_d30.head(5).iterrows():
+for idx, row in coefs_d1_29.head(5).iterrows():
     print(f"      {row['Feature']:20s}: {row['Coefficient']:+.4f}")
 
-# Create prediction vs actual by loan age (D30 model)
-d30_train_results = pd.DataFrame({
+# Create prediction vs actual by loan age (D1-29 model)
+d1_29_train_results = pd.DataFrame({
     'loan_age_months': current_transitions.loc[train_idx, 'loan_age_months'],
     'actual': y_train,
     'predicted_prob': y_train_pred_proba,
     'sample': 'train',
-    'model': 'Current_to_D30'
+    'model': 'Current_to_D1_29'
 })
 
-d30_test_results = pd.DataFrame({
+d1_29_test_results = pd.DataFrame({
     'loan_age_months': current_transitions.loc[test_idx, 'loan_age_months'],
     'actual': y_test,
     'predicted_prob': y_test_pred_proba,
     'sample': 'test',
-    'model': 'Current_to_D30'
+    'model': 'Current_to_D1_29'
 })
 
-d30_results_combined = pd.concat([d30_train_results, d30_test_results], ignore_index=True)
+d1_29_results_combined = pd.concat([d1_29_train_results, d1_29_test_results], ignore_index=True)
 
 # Aggregate by loan_age_months and sample
-d30_by_age = d30_results_combined.groupby(['loan_age_months', 'sample']).agg({
+d1_29_by_age = d1_29_results_combined.groupby(['loan_age_months', 'sample']).agg({
     'actual': ['mean', 'count'],
     'predicted_prob': 'mean'
 }).reset_index()
 
-d30_by_age.columns = ['loan_age_months', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
-d30_by_age['model'] = 'Current_to_D30'
-d30_by_age = d30_by_age.sort_values(['loan_age_months', 'sample'])
+d1_29_by_age.columns = ['loan_age_months', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+d1_29_by_age['model'] = 'Current_to_D1_29'
+# Filter to only show age >= 1 month
+d1_29_by_age = d1_29_by_age[d1_29_by_age['loan_age_months'] >= 1]
+d1_29_by_age = d1_29_by_age.sort_values(['loan_age_months', 'sample'])
 
-print(f"\n    Prediction vs Actual by Loan Age (D30)")
+print(f"\n    Prediction vs Actual by Loan Age (D1-29)")
 
 # ============================================================================
-# Model B: Current → Prepaid
+# Model B: Current → Payoff
 # ============================================================================
-print("\n  Model B: Current → Prepaid...")
-print("    Using only: program, loan_term, loan_age_months")
+print("\n  Model B: Current → Payoff...")
+print("    Using all categorical features: program, loan_term (dummies), age buckets, FICO buckets, UPB buckets")
 
-# Simplified features for prepayment: only program, term, and loan age
-prepay_numeric_features = ['loan_term', 'loan_age_months']
+# Build prepay feature matrix with all dummies
+# Add program dummies
 prepay_program_dummies = pd.get_dummies(current_transitions['program'], prefix='program', drop_first=True)
-X_prepay = pd.concat([current_transitions[prepay_numeric_features], prepay_program_dummies], axis=1)
+
+# Add age bucket dummies (drop first to avoid multicollinearity)
+# Age buckets already created above for D1-29 model
+prepay_age_bucket_dummies = pd.get_dummies(current_transitions['age_bucket'], prefix='age', drop_first=True)
+
+# Add FICO bucket dummies (drop first) - FICO buckets already created above
+prepay_fico_bucket_dummies = pd.get_dummies(current_transitions['fico_bucket'], prefix='fico', drop_first=True)
+
+# Add UPB bucket dummies (drop second bucket '1-2.5k' instead of first) - NEW FEATURE replacing approved_amount
+all_upb_dummies = pd.get_dummies(current_transitions['upb_bucket'], prefix='upb')
+# Keep all buckets except the second one (upb_1-2.5k)
+prepay_upb_bucket_dummies = all_upb_dummies.drop(columns=['upb_upb_1-2.5k'])
+
+# Add loan term dummies (drop first)
+prepay_loan_term_dummies = pd.get_dummies(current_transitions['loan_term'], prefix='term', drop_first=True)
+
+# Combine all dummy features for prepay model (removed time_to_maturity since UPB captures that signal)
+X_prepay = pd.concat([prepay_program_dummies, prepay_age_bucket_dummies, prepay_fico_bucket_dummies,
+                      prepay_upb_bucket_dummies, prepay_loan_term_dummies], axis=1)
 
 y_prepay = current_transitions['to_prepay']
 valid_idx = X_prepay.notna().all(axis=1) & y_prepay.notna()
@@ -225,7 +323,7 @@ y_clean = y_prepay[valid_idx]
 
 print(f"    Valid observations: {len(X_prepay_clean):,}")
 print(f"    Positive class rate: {y_clean.mean()*100:.2f}%")
-print(f"    Features: {len(X_prepay_clean.columns)} ({len(prepay_numeric_features)} numeric + {len(prepay_program_dummies.columns)} program dummies)")
+print(f"    Features: {len(X_prepay_clean.columns)} ({len(prepay_program_dummies.columns)} program + {len(prepay_age_bucket_dummies.columns)} age + {len(prepay_fico_bucket_dummies.columns)} FICO + {len(prepay_upb_bucket_dummies.columns)} UPB + {len(prepay_loan_term_dummies.columns)} term)")
 
 # Get indices for train/test split to track report dates
 prepay_train_idx, prepay_test_idx = train_test_split(
@@ -291,9 +389,11 @@ prepay_by_age = prepay_results_combined.groupby(['loan_age_months', 'sample']).a
 
 prepay_by_age.columns = ['loan_age_months', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
 prepay_by_age['model'] = 'Current_to_Prepay'
+# Filter to only show age >= 1 month
+prepay_by_age = prepay_by_age[prepay_by_age['loan_age_months'] >= 1]
 prepay_by_age = prepay_by_age.sort_values(['loan_age_months', 'sample'])
 
-print(f"\n    Prediction vs Actual by Loan Age (Prepay)")
+print(f"\n    Prediction vs Actual by Loan Age (Payoff)")
 
 # ============================================================================
 # 4. BUILD EMPIRICAL MATRICES (PROGRAM x TERM) FOR OTHER TRANSITIONS
@@ -305,22 +405,8 @@ programs = sorted(transitions['program'].unique())
 print(f"  Programs: {programs}")
 
 # Define term buckets
-def categorize_term(term):
-    if term <= 3:
-        return '0-3m'
-    elif term <= 6:
-        return '4-6m'
-    elif term <= 12:
-        return '7-12m'
-    elif term <= 18:
-        return '13-18m'
-    elif term <= 24:
-        return '19-24m'
-    else:
-        return '24m+'
-
-transitions['term_bucket'] = transitions['loan_term'].apply(categorize_term)
-term_buckets = ['0-3m', '4-6m', '7-12m', '13-18m', '19-24m', '24m+']
+transitions['term_bucket'] = transitions['loan_term']
+term_buckets = transitions['term_bucket'].unique().tolist()
 
 # Define transition states
 delinq_states = ['D1_29', 'D30_59', 'D60_89', 'D90_119', 'D120_PLUS']
@@ -410,16 +496,16 @@ import pickle
 
 hybrid_models = {
     # Regression models (for CURRENT state only)
-    'model_d30': model_d30,
-    'scaler_d30': scaler_d30,
+    'model_d1_29': model_d1_29,
+    'scaler_d1_29': scaler_d1_29,
     'model_prepay': model_prepay,
     'scaler_prepay': scaler_prepay,
 
     # Feature columns for each model
-    'feature_cols_d30': feature_cols,  # Features for D30+ model
-    'feature_cols_prepay': prepay_feature_cols,  # Features for Prepay model (program, term, age only)
-    'numeric_features_d30': numeric_features,
-    'numeric_features_prepay': prepay_numeric_features,
+    'feature_cols_d1_29': feature_cols,  # Features for D1-29 model (all categorical/dummies)
+    'feature_cols_prepay': prepay_feature_cols,  # Features for Prepay model (all categorical/dummies)
+    'numeric_features_d1_29': [],  # No numeric features - all categorical
+    'numeric_features_prepay': [],  # No numeric features - all categorical
 
     # Empirical matrices (for all delinquency states)
     'transition_matrices': transition_matrices,
@@ -431,11 +517,11 @@ hybrid_models = {
     'delinq_states': delinq_states,
 
     # Model performance
-    'auc_d30': auc_d30,
+    'auc_d1_29': auc_d1_29,
     'auc_prepay': auc_prepay,
 
     # Feature importance
-    'feature_importance_d30': coefs_d30,
+    'feature_importance_d1_29': coefs_d1_29,
     'feature_importance_prepay': coefs_prepay
 }
 
@@ -445,12 +531,12 @@ with open('hybrid_transition_models.pkl', 'wb') as f:
 print("  ✓ Saved to hybrid_transition_models.pkl")
 
 # Save feature importance to CSV for review
-coefs_d30.to_csv('feature_importance_d30.csv', index=False)
+coefs_d1_29.to_csv('feature_importance_d1_29.csv', index=False)
 coefs_prepay.to_csv('feature_importance_prepay.csv', index=False)
 print("  ✓ Saved feature importance to CSV files")
 
-# Combine D30 and Prepay predictions into single CSV
-combined_predictions = pd.concat([d30_by_age, prepay_by_age], ignore_index=True)
+# Combine D1-29 and Payoff predictions into single CSV
+combined_predictions = pd.concat([d1_29_by_age, prepay_by_age], ignore_index=True)
 combined_predictions = combined_predictions.sort_values(['model', 'sample', 'loan_age_months'])
 combined_predictions.to_csv('current_state_predictions_by_age.csv', index=False)
 print("  ✓ Saved combined prediction vs actual to current_state_predictions_by_age.csv")
@@ -469,10 +555,10 @@ fig, axes = plt.subplots(1, 2, figsize=(20, 7))
 fig.suptitle('Current State Transition Models: Prediction vs Actual by Loan Age',
              fontsize=16, fontweight='bold', y=0.98)
 
-# Left: D30+ Model (both train and test)
+# Left: D1-29 Model (both train and test)
 ax = axes[0]
-train_data = d30_by_age[d30_by_age['sample'] == 'train'].copy()
-test_data = d30_by_age[d30_by_age['sample'] == 'test'].copy()
+train_data = d1_29_by_age[d1_29_by_age['sample'] == 'train'].copy()
+test_data = d1_29_by_age[d1_29_by_age['sample'] == 'test'].copy()
 
 ax.plot(train_data['loan_age_months'], train_data['actual_rate'] * 100,
         marker='o', linewidth=2, markersize=3, label='Train Actual', color='steelblue', alpha=0.7)
@@ -484,8 +570,8 @@ ax.plot(test_data['loan_age_months'], test_data['predicted_rate'] * 100,
         marker='', linewidth=2, label='Test Predicted', color='red', linestyle='--', alpha=0.7)
 
 ax.set_xlabel('Loan Age (Months)', fontsize=12, fontweight='bold')
-ax.set_ylabel('D30+ Rate (%)', fontsize=12, fontweight='bold')
-ax.set_title('Current → D30+ (Delinquency)', fontsize=14, fontweight='bold')
+ax.set_ylabel('D1-29 Rate (%)', fontsize=12, fontweight='bold')
+ax.set_title('Current → D1-29 (Early Delinquency)', fontsize=14, fontweight='bold')
 ax.legend(fontsize=10, loc='best', ncol=2)
 ax.grid(alpha=0.3)
 ax.tick_params(axis='x', labelsize=10)
@@ -513,8 +599,8 @@ ax.plot(test_data['loan_age_months'], test_data['predicted_rate'] * 100,
         marker='', linewidth=2, label='Test Predicted', color='darkorange', linestyle='--', alpha=0.7)
 
 ax.set_xlabel('Loan Age (Months)', fontsize=12, fontweight='bold')
-ax.set_ylabel('Prepay Rate (%)', fontsize=12, fontweight='bold')
-ax.set_title('Current → Prepay', fontsize=14, fontweight='bold')
+ax.set_ylabel('Payoff Rate (%)', fontsize=12, fontweight='bold')
+ax.set_title('Current → Payoff', fontsize=14, fontweight='bold')
 ax.legend(fontsize=10, loc='best', ncol=2)
 ax.grid(alpha=0.3)
 ax.tick_params(axis='x', labelsize=10)
@@ -533,24 +619,26 @@ print("  ✓ Saved combined visualization: current_state_models_combined.png")
 plt.close()
 
 # ============================================================================
-# Chart 2: Program-Level Charts (D30+ and Prepay by Program)
+# Chart 2: Program-Level Charts by Term (D1-29 and Prepay by Program × Term)
 # ============================================================================
-print("  Creating program-level visualizations...")
+print("  Creating program-level visualizations by term...")
 
 # Merge program info back to predictions
-# D30+ model - use the actual y values from the split
-d30_y_train = y_d30.loc[train_idx]
-d30_y_test = y_d30.loc[test_idx]
+# D1-29 model - use the actual y values from the split
+d1_29_y_train = y_d1_29.loc[train_idx]
+d1_29_y_test = y_d1_29.loc[test_idx]
 
-d30_results_with_program = pd.DataFrame({
+d1_29_results_with_program = pd.DataFrame({
     'loan_age_months': current_transitions.loc[train_idx, 'loan_age_months'].tolist() +
                        current_transitions.loc[test_idx, 'loan_age_months'].tolist(),
     'program': current_transitions.loc[train_idx, 'program'].tolist() +
                current_transitions.loc[test_idx, 'program'].tolist(),
-    'actual': d30_y_train.tolist() + d30_y_test.tolist(),
+    'loan_term': current_transitions.loc[train_idx, 'loan_term'].tolist() +
+                 current_transitions.loc[test_idx, 'loan_term'].tolist(),
+    'actual': d1_29_y_train.tolist() + d1_29_y_test.tolist(),
     'predicted_prob': y_train_pred_proba.tolist() + y_test_pred_proba.tolist(),
     'sample': ['train'] * len(train_idx) + ['test'] * len(test_idx),
-    'model': 'Current_to_D30'
+    'model': 'Current_to_D1_29'
 })
 
 # Prepay model - use the actual y values from the split
@@ -562,110 +650,481 @@ prepay_results_with_program = pd.DataFrame({
                        current_transitions.loc[prepay_test_idx, 'loan_age_months'].tolist(),
     'program': current_transitions.loc[prepay_train_idx, 'program'].tolist() +
                current_transitions.loc[prepay_test_idx, 'program'].tolist(),
+    'loan_term': current_transitions.loc[prepay_train_idx, 'loan_term'].tolist() +
+                 current_transitions.loc[prepay_test_idx, 'loan_term'].tolist(),
     'actual': prepay_y_train.tolist() + prepay_y_test.tolist(),
     'predicted_prob': y_train_pred_proba_prepay.tolist() + y_test_pred_proba_prepay.tolist(),
     'sample': ['train'] * len(prepay_train_idx) + ['test'] * len(prepay_test_idx),
     'model': 'Current_to_Prepay'
 })
 
-# Aggregate by loan_age_months, sample, and program
-d30_by_program = d30_results_with_program.groupby(['loan_age_months', 'sample', 'program']).agg({
-    'actual': ['mean', 'count'],
-    'predicted_prob': 'mean'
-}).reset_index()
-d30_by_program.columns = ['loan_age_months', 'sample', 'program', 'actual_rate', 'num_obs', 'predicted_rate']
-
-prepay_by_program = prepay_results_with_program.groupby(['loan_age_months', 'sample', 'program']).agg({
-    'actual': ['mean', 'count'],
-    'predicted_prob': 'mean'
-}).reset_index()
-prepay_by_program.columns = ['loan_age_months', 'sample', 'program', 'actual_rate', 'num_obs', 'predicted_rate']
-
-# Get unique programs
+# Get unique programs and top terms
 unique_programs = sorted(current_transitions['program'].unique())
 num_programs = len(unique_programs)
 
-# Create subplots: 2 columns (D30+, Prepay) x N rows (one per program)
-fig, axes = plt.subplots(num_programs, 2, figsize=(20, 6 * num_programs))
-if num_programs == 1:
+# Get top 6 most common terms
+common_terms = sorted(current_transitions['loan_term'].value_counts().head(6).index.tolist())
+num_terms = len(common_terms)
+
+# Create subplots: 2 columns (D1-29, Prepay) x (num_terms × num_programs) rows
+# Each term gets a section with all programs
+fig, axes = plt.subplots(num_terms * num_programs, 2, figsize=(20, 6 * num_terms * num_programs))
+if num_terms * num_programs == 1:
     axes = axes.reshape(1, -1)
 
-fig.suptitle('Current State Models by Program: Prediction vs Actual',
-             fontsize=18, fontweight='bold', y=0.995)
+fig.suptitle('Current State Models by Program and Term: Prediction vs Actual',
+             fontsize=18, fontweight='bold', y=0.998)
 
-# D30+ models by program (left column)
-for i, program in enumerate(unique_programs):
-    ax = axes[i, 0]
+# Iterate through terms, then programs within each term
+row_idx = 0
+for term_idx, term in enumerate(common_terms):
+    for prog_idx, program in enumerate(unique_programs):
+        # D1-29 model (left column)
+        ax = axes[row_idx, 0]
 
-    # Filter data for this program
-    prog_data = d30_by_program[d30_by_program['program'] == program].copy()
-    train_data = prog_data[prog_data['sample'] == 'train']
-    test_data = prog_data[prog_data['sample'] == 'test']
+        # Filter data for this term and program
+        term_prog_data = d1_29_results_with_program[
+            (d1_29_results_with_program['loan_term'] == term) &
+            (d1_29_results_with_program['program'] == program)
+        ].copy()
 
-    # Plot
-    if len(train_data) > 0:
-        ax.plot(train_data['loan_age_months'], train_data['actual_rate'] * 100,
-                marker='o', linewidth=2, markersize=3, label='Train Actual', color='steelblue', alpha=0.7)
-        ax.plot(train_data['loan_age_months'], train_data['predicted_rate'] * 100,
-                marker='', linewidth=2, label='Train Predicted', color='coral', linestyle='--', alpha=0.7)
-    if len(test_data) > 0:
-        ax.plot(test_data['loan_age_months'], test_data['actual_rate'] * 100,
-                marker='s', linewidth=2, markersize=3, label='Test Actual', color='navy', alpha=0.7)
-        ax.plot(test_data['loan_age_months'], test_data['predicted_rate'] * 100,
-                marker='', linewidth=2, label='Test Predicted', color='red', linestyle='--', alpha=0.7)
+        # Aggregate by loan age
+        if len(term_prog_data) > 0:
+            aggregated = term_prog_data.groupby(['loan_age_months', 'sample']).agg({
+                'actual': ['mean', 'count'],
+                'predicted_prob': 'mean'
+            }).reset_index()
+            aggregated.columns = ['loan_age_months', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+            # Filter to only show age >= 1 month
+            aggregated = aggregated[aggregated['loan_age_months'] >= 1]
 
-    ax.set_xlabel('Loan Age (Months)', fontsize=11, fontweight='bold')
-    ax.set_ylabel('D30+ Rate (%)', fontsize=11, fontweight='bold')
-    ax.set_title(f'{program} - D30+', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=9, loc='best', ncol=2)
-    ax.grid(alpha=0.3)
-    ax.tick_params(axis='x', labelsize=9)
+            train_data = aggregated[aggregated['sample'] == 'train']
+            test_data = aggregated[aggregated['sample'] == 'test']
 
-    # Add sample size
-    total_train = train_data['num_obs'].sum() if len(train_data) > 0 else 0
-    total_test = test_data['num_obs'].sum() if len(test_data) > 0 else 0
-    ax.text(0.02, 0.98, f"Train: {total_train:,} | Test: {total_test:,}",
-            transform=ax.transAxes, fontsize=8, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+            # Plot
+            if len(train_data) > 0:
+                ax.plot(train_data['loan_age_months'], train_data['actual_rate'] * 100,
+                        marker='o', linewidth=2, markersize=3, label='Train Actual', color='steelblue', alpha=0.7)
+                ax.plot(train_data['loan_age_months'], train_data['predicted_rate'] * 100,
+                        marker='', linewidth=2, label='Train Predicted', color='coral', linestyle='--', alpha=0.7)
+            if len(test_data) > 0:
+                ax.plot(test_data['loan_age_months'], test_data['actual_rate'] * 100,
+                        marker='s', linewidth=2, markersize=3, label='Test Actual', color='navy', alpha=0.7)
+                ax.plot(test_data['loan_age_months'], test_data['predicted_rate'] * 100,
+                        marker='', linewidth=2, label='Test Predicted', color='red', linestyle='--', alpha=0.7)
 
-# Prepay models by program (right column)
-for i, program in enumerate(unique_programs):
-    ax = axes[i, 1]
+            # Add sample size
+            total_train = train_data['num_obs'].sum() if len(train_data) > 0 else 0
+            total_test = test_data['num_obs'].sum() if len(test_data) > 0 else 0
+            ax.text(0.02, 0.98, f"n={total_train:,}/{total_test:,}",
+                    transform=ax.transAxes, fontsize=8, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
 
-    # Filter data for this program
-    prog_data = prepay_by_program[prepay_by_program['program'] == program].copy()
-    train_data = prog_data[prog_data['sample'] == 'train']
-    test_data = prog_data[prog_data['sample'] == 'test']
+        ax.set_xlabel('Loan Age (Months)', fontsize=10, fontweight='bold')
+        ax.set_ylabel('D1-29 Rate (%)', fontsize=10, fontweight='bold')
+        ax.set_title(f'Term={term}m, {program} - D1-29', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=8, loc='best', ncol=2)
+        ax.grid(alpha=0.3)
+        ax.tick_params(axis='x', labelsize=9)
+        ax.tick_params(axis='y', labelsize=9)
 
-    # Plot
-    if len(train_data) > 0:
-        ax.plot(train_data['loan_age_months'], train_data['actual_rate'] * 100,
-                marker='o', linewidth=2, markersize=3, label='Train Actual', color='forestgreen', alpha=0.7)
-        ax.plot(train_data['loan_age_months'], train_data['predicted_rate'] * 100,
-                marker='', linewidth=2, label='Train Predicted', color='orange', linestyle='--', alpha=0.7)
-    if len(test_data) > 0:
-        ax.plot(test_data['loan_age_months'], test_data['actual_rate'] * 100,
-                marker='s', linewidth=2, markersize=3, label='Test Actual', color='darkgreen', alpha=0.7)
-        ax.plot(test_data['loan_age_months'], test_data['predicted_rate'] * 100,
-                marker='', linewidth=2, label='Test Predicted', color='darkorange', linestyle='--', alpha=0.7)
+        # Prepay model (right column)
+        ax = axes[row_idx, 1]
 
-    ax.set_xlabel('Loan Age (Months)', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Prepay Rate (%)', fontsize=11, fontweight='bold')
-    ax.set_title(f'{program} - Prepay', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=9, loc='best', ncol=2)
-    ax.grid(alpha=0.3)
-    ax.tick_params(axis='x', labelsize=9)
+        # Filter data for this term and program
+        term_prog_data = prepay_results_with_program[
+            (prepay_results_with_program['loan_term'] == term) &
+            (prepay_results_with_program['program'] == program)
+        ].copy()
 
-    # Add sample size
-    total_train = train_data['num_obs'].sum() if len(train_data) > 0 else 0
-    total_test = test_data['num_obs'].sum() if len(test_data) > 0 else 0
-    ax.text(0.02, 0.98, f"Train: {total_train:,} | Test: {total_test:,}",
-            transform=ax.transAxes, fontsize=8, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        # Aggregate by loan age
+        if len(term_prog_data) > 0:
+            aggregated = term_prog_data.groupby(['loan_age_months', 'sample']).agg({
+                'actual': ['mean', 'count'],
+                'predicted_prob': 'mean'
+            }).reset_index()
+            aggregated.columns = ['loan_age_months', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+            # Filter to only show age >= 1 month
+            aggregated = aggregated[aggregated['loan_age_months'] >= 1]
+
+            train_data = aggregated[aggregated['sample'] == 'train']
+            test_data = aggregated[aggregated['sample'] == 'test']
+
+            # Plot
+            if len(train_data) > 0:
+                ax.plot(train_data['loan_age_months'], train_data['actual_rate'] * 100,
+                        marker='o', linewidth=2, markersize=3, label='Train Actual', color='forestgreen', alpha=0.7)
+                ax.plot(train_data['loan_age_months'], train_data['predicted_rate'] * 100,
+                        marker='', linewidth=2, label='Train Predicted', color='orange', linestyle='--', alpha=0.7)
+            if len(test_data) > 0:
+                ax.plot(test_data['loan_age_months'], test_data['actual_rate'] * 100,
+                        marker='s', linewidth=2, markersize=3, label='Test Actual', color='darkgreen', alpha=0.7)
+                ax.plot(test_data['loan_age_months'], test_data['predicted_rate'] * 100,
+                        marker='', linewidth=2, label='Test Predicted', color='darkorange', linestyle='--', alpha=0.7)
+
+            # Add sample size
+            total_train = train_data['num_obs'].sum() if len(train_data) > 0 else 0
+            total_test = test_data['num_obs'].sum() if len(test_data) > 0 else 0
+            ax.text(0.02, 0.98, f"n={total_train:,}/{total_test:,}",
+                    transform=ax.transAxes, fontsize=8, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+
+        ax.set_xlabel('Loan Age (Months)', fontsize=10, fontweight='bold')
+        ax.set_ylabel('Payoff Rate (%)', fontsize=10, fontweight='bold')
+        ax.set_title(f'Term={term}m, {program} - Payoff', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=8, loc='best', ncol=2)
+        ax.grid(alpha=0.3)
+        ax.tick_params(axis='x', labelsize=9)
+        ax.tick_params(axis='y', labelsize=9)
+
+        row_idx += 1
 
 plt.tight_layout(rect=[0, 0, 1, 0.99])
 plt.savefig('current_state_models_by_program.png', dpi=150, bbox_inches='tight')
 print("  ✓ Saved program-level visualization: current_state_models_by_program.png")
+plt.close()
+
+# ============================================================================
+# Chart 3: By Vintage (Age Buckets)
+# ============================================================================
+print("  Creating vintage-level visualizations...")
+
+# Add age buckets to results
+d1_29_results_with_vintage = d1_29_results_with_program.copy()
+d1_29_results_with_vintage['vintage'] = d1_29_results_with_vintage['loan_age_months'].apply(create_age_buckets)
+
+prepay_results_with_vintage = prepay_results_with_program.copy()
+prepay_results_with_vintage['vintage'] = prepay_results_with_vintage['loan_age_months'].apply(create_age_buckets)
+
+# Aggregate by vintage and sample
+d1_29_by_vintage = d1_29_results_with_vintage.groupby(['vintage', 'sample']).agg({
+    'actual': ['mean', 'count'],
+    'predicted_prob': 'mean'
+}).reset_index()
+d1_29_by_vintage.columns = ['vintage', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+
+prepay_by_vintage = prepay_results_with_vintage.groupby(['vintage', 'sample']).agg({
+    'actual': ['mean', 'count'],
+    'predicted_prob': 'mean'
+}).reset_index()
+prepay_by_vintage.columns = ['vintage', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+
+# Define vintage order
+vintage_order = ['0-1m', '2-3m', '4-6m', '7-12m', '13-18m', '19-24m', '24m+']
+d1_29_by_vintage['vintage'] = pd.Categorical(d1_29_by_vintage['vintage'], categories=vintage_order, ordered=True)
+prepay_by_vintage['vintage'] = pd.Categorical(prepay_by_vintage['vintage'], categories=vintage_order, ordered=True)
+d1_29_by_vintage = d1_29_by_vintage.sort_values('vintage')
+prepay_by_vintage = prepay_by_vintage.sort_values('vintage')
+
+# Create chart
+fig, axes = plt.subplots(1, 2, figsize=(20, 7))
+fig.suptitle('Current State Models by Vintage (Age Bucket): Prediction vs Actual',
+             fontsize=16, fontweight='bold', y=0.98)
+
+# D1-29 by vintage
+ax = axes[0]
+train_data = d1_29_by_vintage[d1_29_by_vintage['sample'] == 'train']
+test_data = d1_29_by_vintage[d1_29_by_vintage['sample'] == 'test']
+
+x_pos = np.arange(len(vintage_order))
+width = 0.35
+
+ax.bar(x_pos - width/2, train_data['actual_rate'] * 100, width,
+       label='Train Actual', color='steelblue', alpha=0.7)
+ax.bar(x_pos + width/2, test_data['actual_rate'] * 100, width,
+       label='Test Actual', color='navy', alpha=0.7)
+ax.plot(x_pos, train_data['predicted_rate'] * 100, marker='o', linewidth=2,
+        markersize=8, label='Train Predicted', color='coral', linestyle='--')
+ax.plot(x_pos, test_data['predicted_rate'] * 100, marker='s', linewidth=2,
+        markersize=8, label='Test Predicted', color='red', linestyle='--')
+
+ax.set_xlabel('Vintage (Age Bucket)', fontsize=12, fontweight='bold')
+ax.set_ylabel('D1-29 Rate (%)', fontsize=12, fontweight='bold')
+ax.set_title('Current → D1-29 by Vintage', fontsize=14, fontweight='bold')
+ax.set_xticks(x_pos)
+ax.set_xticklabels(vintage_order, fontsize=10)
+ax.legend(fontsize=10, loc='best')
+ax.grid(alpha=0.3, axis='y')
+
+# Add sample counts
+for i, vintage in enumerate(vintage_order):
+    train_count = train_data[train_data['vintage'] == vintage]['num_obs'].values
+    test_count = test_data[test_data['vintage'] == vintage]['num_obs'].values
+    if len(train_count) > 0 and len(test_count) > 0:
+        ax.text(i, -0.5, f"n={train_count[0]:,}/{test_count[0]:,}",
+                ha='center', fontsize=8, rotation=0)
+
+# Prepay by vintage
+ax = axes[1]
+train_data = prepay_by_vintage[prepay_by_vintage['sample'] == 'train']
+test_data = prepay_by_vintage[prepay_by_vintage['sample'] == 'test']
+
+ax.bar(x_pos - width/2, train_data['actual_rate'] * 100, width,
+       label='Train Actual', color='forestgreen', alpha=0.7)
+ax.bar(x_pos + width/2, test_data['actual_rate'] * 100, width,
+       label='Test Actual', color='darkgreen', alpha=0.7)
+ax.plot(x_pos, train_data['predicted_rate'] * 100, marker='o', linewidth=2,
+        markersize=8, label='Train Predicted', color='orange', linestyle='--')
+ax.plot(x_pos, test_data['predicted_rate'] * 100, marker='s', linewidth=2,
+        markersize=8, label='Test Predicted', color='darkorange', linestyle='--')
+
+ax.set_xlabel('Vintage (Age Bucket)', fontsize=12, fontweight='bold')
+ax.set_ylabel('Payoff Rate (%)', fontsize=12, fontweight='bold')
+ax.set_title('Current → Payoff by Vintage', fontsize=14, fontweight='bold')
+ax.set_xticks(x_pos)
+ax.set_xticklabels(vintage_order, fontsize=10)
+ax.legend(fontsize=10, loc='best')
+ax.grid(alpha=0.3, axis='y')
+
+# Add sample counts
+for i, vintage in enumerate(vintage_order):
+    train_count = train_data[train_data['vintage'] == vintage]['num_obs'].values
+    test_count = test_data[test_data['vintage'] == vintage]['num_obs'].values
+    if len(train_count) > 0 and len(test_count) > 0:
+        ax.text(i, -0.5, f"n={train_count[0]:,}/{test_count[0]:,}",
+                ha='center', fontsize=8, rotation=0)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig('current_state_models_by_age_bucket.png', dpi=150, bbox_inches='tight')
+print("  ✓ Saved age bucket visualization: current_state_models_by_age_bucket.png")
+plt.close()
+
+# ============================================================================
+# Chart 4: By Vintage Quarter (Disbursement Quarter, excluding 2019) - BY PROGRAM
+# ============================================================================
+print("  Creating vintage quarter visualizations by program...")
+
+# Extract disbursement quarter from transitions
+d1_29_results_with_vintage_qtr = d1_29_results_with_program.copy()
+d1_29_results_with_vintage_qtr['disbursement_d'] = current_transitions.loc[train_idx, 'disbursement_d'].tolist() + \
+                                                     current_transitions.loc[test_idx, 'disbursement_d'].tolist()
+d1_29_results_with_vintage_qtr['disbursement_dt'] = pd.to_datetime(d1_29_results_with_vintage_qtr['disbursement_d'])
+d1_29_results_with_vintage_qtr['disbursement_year'] = d1_29_results_with_vintage_qtr['disbursement_dt'].dt.year
+d1_29_results_with_vintage_qtr['disbursement_quarter'] = d1_29_results_with_vintage_qtr['disbursement_dt'].dt.to_period('Q').astype(str)
+
+prepay_results_with_vintage_qtr = prepay_results_with_program.copy()
+prepay_results_with_vintage_qtr['disbursement_d'] = current_transitions.loc[prepay_train_idx, 'disbursement_d'].tolist() + \
+                                                      current_transitions.loc[prepay_test_idx, 'disbursement_d'].tolist()
+prepay_results_with_vintage_qtr['disbursement_dt'] = pd.to_datetime(prepay_results_with_vintage_qtr['disbursement_d'])
+prepay_results_with_vintage_qtr['disbursement_year'] = prepay_results_with_vintage_qtr['disbursement_dt'].dt.year
+prepay_results_with_vintage_qtr['disbursement_quarter'] = prepay_results_with_vintage_qtr['disbursement_dt'].dt.to_period('Q').astype(str)
+
+# Exclude 2019
+d1_29_results_with_vintage_qtr = d1_29_results_with_vintage_qtr[d1_29_results_with_vintage_qtr['disbursement_year'] >= 2020]
+prepay_results_with_vintage_qtr = prepay_results_with_vintage_qtr[prepay_results_with_vintage_qtr['disbursement_year'] >= 2020]
+
+# Aggregate by disbursement quarter, program, and sample
+d1_29_by_vintage_qtr = d1_29_results_with_vintage_qtr.groupby(['disbursement_quarter', 'program', 'sample']).agg({
+    'actual': ['mean', 'count'],
+    'predicted_prob': 'mean'
+}).reset_index()
+d1_29_by_vintage_qtr.columns = ['disbursement_quarter', 'program', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+d1_29_by_vintage_qtr = d1_29_by_vintage_qtr.sort_values(['program', 'disbursement_quarter'])
+
+prepay_by_vintage_qtr = prepay_results_with_vintage_qtr.groupby(['disbursement_quarter', 'program', 'sample']).agg({
+    'actual': ['mean', 'count'],
+    'predicted_prob': 'mean'
+}).reset_index()
+prepay_by_vintage_qtr.columns = ['disbursement_quarter', 'program', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+prepay_by_vintage_qtr = prepay_by_vintage_qtr.sort_values(['program', 'disbursement_quarter'])
+
+# Get unique programs and quarters
+programs = sorted(d1_29_results_with_vintage_qtr['program'].unique())
+unique_quarters = sorted(d1_29_by_vintage_qtr['disbursement_quarter'].unique())
+
+# Create chart with 3 rows (one per program) and 2 columns (D1-29, Prepay)
+fig, axes = plt.subplots(3, 2, figsize=(20, 18))
+fig.suptitle('Current State Models by Vintage Quarter (Disbursement Quarter, 2020+) by Program: Prediction vs Actual',
+             fontsize=16, fontweight='bold', y=0.995)
+
+for row_idx, program in enumerate(programs):
+    # D1-29 by vintage quarter for this program
+    ax = axes[row_idx, 0]
+
+    prog_data = d1_29_by_vintage_qtr[d1_29_by_vintage_qtr['program'] == program]
+    train_data = prog_data[prog_data['sample'] == 'train']
+    test_data = prog_data[prog_data['sample'] == 'test']
+
+    # Get quarters for this program
+    prog_quarters = sorted(prog_data['disbursement_quarter'].unique())
+    x_pos = np.arange(len(prog_quarters))
+    width = 0.35
+
+    if len(train_data) > 0 and len(test_data) > 0:
+        ax.bar(x_pos - width/2, train_data['actual_rate'] * 100, width,
+               label='Train Actual', color='steelblue', alpha=0.7)
+        ax.bar(x_pos + width/2, test_data['actual_rate'] * 100, width,
+               label='Test Actual', color='navy', alpha=0.7)
+        ax.plot(x_pos, train_data['predicted_rate'] * 100, marker='o', linewidth=2,
+                markersize=8, label='Train Predicted', color='coral', linestyle='--')
+        ax.plot(x_pos, test_data['predicted_rate'] * 100, marker='s', linewidth=2,
+                markersize=8, label='Test Predicted', color='red', linestyle='--')
+
+        # Add sample counts
+        for i, qtr in enumerate(prog_quarters):
+            train_count = train_data[train_data['disbursement_quarter'] == qtr]['num_obs'].values
+            test_count = test_data[test_data['disbursement_quarter'] == qtr]['num_obs'].values
+            if len(train_count) > 0 and len(test_count) > 0:
+                ax.text(i, -0.5, f"n={train_count[0]:,}/{test_count[0]:,}",
+                        ha='center', fontsize=7, rotation=45)
+
+    ax.set_xlabel('Vintage Quarter (Disbursement Quarter)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('D1-29 Rate (%)', fontsize=11, fontweight='bold')
+    ax.set_title(f'{program} - Current → D1-29 by Vintage Quarter', fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(prog_quarters, fontsize=8, rotation=45, ha='right')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(alpha=0.3, axis='y')
+
+    # Prepay by vintage quarter for this program
+    ax = axes[row_idx, 1]
+
+    prog_data = prepay_by_vintage_qtr[prepay_by_vintage_qtr['program'] == program]
+    train_data = prog_data[prog_data['sample'] == 'train']
+    test_data = prog_data[prog_data['sample'] == 'test']
+
+    # Get quarters for this program
+    prog_quarters = sorted(prog_data['disbursement_quarter'].unique())
+    x_pos = np.arange(len(prog_quarters))
+
+    if len(train_data) > 0 and len(test_data) > 0:
+        ax.bar(x_pos - width/2, train_data['actual_rate'] * 100, width,
+               label='Train Actual', color='forestgreen', alpha=0.7)
+        ax.bar(x_pos + width/2, test_data['actual_rate'] * 100, width,
+               label='Test Actual', color='darkgreen', alpha=0.7)
+        ax.plot(x_pos, train_data['predicted_rate'] * 100, marker='o', linewidth=2,
+                markersize=8, label='Train Predicted', color='orange', linestyle='--')
+        ax.plot(x_pos, test_data['predicted_rate'] * 100, marker='s', linewidth=2,
+                markersize=8, label='Test Predicted', color='darkorange', linestyle='--')
+
+        # Add sample counts
+        for i, qtr in enumerate(prog_quarters):
+            train_count = train_data[train_data['disbursement_quarter'] == qtr]['num_obs'].values
+            test_count = test_data[test_data['disbursement_quarter'] == qtr]['num_obs'].values
+            if len(train_count) > 0 and len(test_count) > 0:
+                ax.text(i, -0.5, f"n={train_count[0]:,}/{test_count[0]:,}",
+                        ha='center', fontsize=7, rotation=45)
+
+    ax.set_xlabel('Vintage Quarter (Disbursement Quarter)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Payoff Rate (%)', fontsize=11, fontweight='bold')
+    ax.set_title(f'{program} - Current → Payoff by Vintage Quarter', fontsize=12, fontweight='bold')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(prog_quarters, fontsize=8, rotation=45, ha='right')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(alpha=0.3, axis='y')
+
+plt.tight_layout(rect=[0, 0, 1, 0.99])
+plt.savefig('current_state_models_by_vintage.png', dpi=150, bbox_inches='tight')
+print("  ✓ Saved vintage quarter visualization by program: current_state_models_by_vintage.png")
+plt.close()
+
+# ============================================================================
+# Chart 5: By Term
+# ============================================================================
+print("  Creating term-level visualizations...")
+
+# Add term to results
+d1_29_results_with_term = d1_29_results_with_program.copy()
+d1_29_results_with_term['term'] = current_transitions.loc[train_idx, 'loan_term'].tolist() + \
+                                    current_transitions.loc[test_idx, 'loan_term'].tolist()
+
+prepay_results_with_term = prepay_results_with_program.copy()
+prepay_results_with_term['term'] = current_transitions.loc[prepay_train_idx, 'loan_term'].tolist() + \
+                                     current_transitions.loc[prepay_test_idx, 'loan_term'].tolist()
+
+# Get most common terms
+common_terms = sorted(current_transitions['loan_term'].value_counts().head(6).index.tolist())
+
+# Filter to common terms
+d1_29_by_term_filtered = d1_29_results_with_term[d1_29_results_with_term['term'].isin(common_terms)]
+prepay_by_term_filtered = prepay_results_with_term[prepay_results_with_term['term'].isin(common_terms)]
+
+# Aggregate by term and sample
+d1_29_by_term = d1_29_by_term_filtered.groupby(['term', 'sample']).agg({
+    'actual': ['mean', 'count'],
+    'predicted_prob': 'mean'
+}).reset_index()
+d1_29_by_term.columns = ['term', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+d1_29_by_term = d1_29_by_term.sort_values('term')
+
+prepay_by_term = prepay_by_term_filtered.groupby(['term', 'sample']).agg({
+    'actual': ['mean', 'count'],
+    'predicted_prob': 'mean'
+}).reset_index()
+prepay_by_term.columns = ['term', 'sample', 'actual_rate', 'num_obs', 'predicted_rate']
+prepay_by_term = prepay_by_term.sort_values('term')
+
+# Create chart
+fig, axes = plt.subplots(1, 2, figsize=(20, 7))
+fig.suptitle('Current State Models by Loan Term: Prediction vs Actual',
+             fontsize=16, fontweight='bold', y=0.98)
+
+# D1-29 by term
+ax = axes[0]
+train_data = d1_29_by_term[d1_29_by_term['sample'] == 'train']
+test_data = d1_29_by_term[d1_29_by_term['sample'] == 'test']
+
+x_pos = np.arange(len(common_terms))
+width = 0.35
+
+ax.bar(x_pos - width/2, train_data['actual_rate'] * 100, width,
+       label='Train Actual', color='steelblue', alpha=0.7)
+ax.bar(x_pos + width/2, test_data['actual_rate'] * 100, width,
+       label='Test Actual', color='navy', alpha=0.7)
+ax.plot(x_pos, train_data['predicted_rate'] * 100, marker='o', linewidth=2,
+        markersize=8, label='Train Predicted', color='coral', linestyle='--')
+ax.plot(x_pos, test_data['predicted_rate'] * 100, marker='s', linewidth=2,
+        markersize=8, label='Test Predicted', color='red', linestyle='--')
+
+ax.set_xlabel('Loan Term (Months)', fontsize=12, fontweight='bold')
+ax.set_ylabel('D1-29 Rate (%)', fontsize=12, fontweight='bold')
+ax.set_title('Current → D1-29 by Term', fontsize=14, fontweight='bold')
+ax.set_xticks(x_pos)
+ax.set_xticklabels([f"{t}m" for t in common_terms], fontsize=10)
+ax.legend(fontsize=10, loc='best')
+ax.grid(alpha=0.3, axis='y')
+
+# Add sample counts
+for i, term in enumerate(common_terms):
+    train_count = train_data[train_data['term'] == term]['num_obs'].values
+    test_count = test_data[test_data['term'] == term]['num_obs'].values
+    if len(train_count) > 0 and len(test_count) > 0:
+        ax.text(i, -0.5, f"n={train_count[0]:,}/{test_count[0]:,}",
+                ha='center', fontsize=8, rotation=0)
+
+# Prepay by term
+ax = axes[1]
+train_data = prepay_by_term[prepay_by_term['sample'] == 'train']
+test_data = prepay_by_term[prepay_by_term['sample'] == 'test']
+
+ax.bar(x_pos - width/2, train_data['actual_rate'] * 100, width,
+       label='Train Actual', color='forestgreen', alpha=0.7)
+ax.bar(x_pos + width/2, test_data['actual_rate'] * 100, width,
+       label='Test Actual', color='darkgreen', alpha=0.7)
+ax.plot(x_pos, train_data['predicted_rate'] * 100, marker='o', linewidth=2,
+        markersize=8, label='Train Predicted', color='orange', linestyle='--')
+ax.plot(x_pos, test_data['predicted_rate'] * 100, marker='s', linewidth=2,
+        markersize=8, label='Test Predicted', color='darkorange', linestyle='--')
+
+ax.set_xlabel('Loan Term (Months)', fontsize=12, fontweight='bold')
+ax.set_ylabel('Payoff Rate (%)', fontsize=12, fontweight='bold')
+ax.set_title('Current → Payoff by Term', fontsize=14, fontweight='bold')
+ax.set_xticks(x_pos)
+ax.set_xticklabels([f"{t}m" for t in common_terms], fontsize=10)
+ax.legend(fontsize=10, loc='best')
+ax.grid(alpha=0.3, axis='y')
+
+# Add sample counts
+for i, term in enumerate(common_terms):
+    train_count = train_data[train_data['term'] == term]['num_obs'].values
+    test_count = test_data[test_data['term'] == term]['num_obs'].values
+    if len(train_count) > 0 and len(test_count) > 0:
+        ax.text(i, -0.5, f"n={train_count[0]:,}/{test_count[0]:,}",
+                ha='center', fontsize=8, rotation=0)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig('current_state_models_by_term.png', dpi=150, bbox_inches='tight')
+print("  ✓ Saved term-level visualization: current_state_models_by_term.png")
 plt.close()
 
 print("\n" + "="*80)
@@ -676,25 +1135,28 @@ print(f"  Dataset: loan_performance_enhanced.csv")
 print(f"  Unique loans: {df['display_id'].nunique():,}")
 print(f"  Total transitions analyzed: {len(transitions):,}")
 print(f"\n  Regression Models (for CURRENT state):")
-print(f"    • Current → D30+ AUC: {auc_d30:.4f}")
+print(f"    • Current → D1-29 AUC: {auc_d1_29:.4f}")
 print(f"      - Features ({len(feature_cols)}): FICO, amount, term, age, UPB, payments, delinq history, program")
-print(f"    • Current → Prepay AUC: {auc_prepay:.4f}")
+print(f"    • Current → Payoff AUC: {auc_prepay:.4f}")
 print(f"      - Features ({len(prepay_feature_cols)}): program, loan_term, loan_age_months ONLY")
 print(f"\n  Empirical Matrices:")
 print(f"    • Delinquency states covered: {len(transition_matrices)}")
 print(f"    • Matrix dimensions: {len(programs)} Programs x {len(term_buckets)} Term buckets")
 print(f"\n  Feature Strategy:")
-print(f"    • D30+ model: Full feature set with delinquency history")
-print(f"    • Prepay model: Simplified - program, term, age only")
+print(f"    • D1-29 model: Full feature set with delinquency history")
+print(f"    • Payoff model: Simplified - program, term, age only")
 print(f"\n  Output Files Generated:")
 print(f"    Models:")
 print(f"      • hybrid_transition_models.pkl - Model objects and matrices")
 print(f"    Feature Importance:")
-print(f"      • feature_importance_d30.csv - D30+ feature coefficients")
-print(f"      • feature_importance_prepay.csv - Prepay feature coefficients")
+print(f"      • feature_importance_d1_29.csv - D1-29 feature coefficients")
+print(f"      • feature_importance_prepay.csv - Payoff feature coefficients")
 print(f"    Predictions:")
-print(f"      • current_state_predictions_by_age.csv - Combined D30+ & Prepay predictions by loan age")
+print(f"      • current_state_predictions_by_age.csv - Combined D1-29 & Payoff predictions by loan age")
 print(f"    Visualizations:")
 print(f"      • current_state_models_combined.png - Overall side-by-side comparison (1x2)")
 print(f"      • current_state_models_by_program.png - Program-level breakdown")
+print(f"      • current_state_models_by_age_bucket.png - Age bucket breakdown")
+print(f"      • current_state_models_by_vintage.png - Vintage quarter (disbursement quarter, 2020+) breakdown")
+print(f"      • current_state_models_by_term.png - Loan term breakdown")
 print("="*80)

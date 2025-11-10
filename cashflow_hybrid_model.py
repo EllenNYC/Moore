@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cashflow Projection Using Hybrid Transition Model
-- Regression for Current → D30 and Current → Prepay
+- Regression for Current → D1-29 and Current → Payoff
 - Empirical Program x Term matrices for other transitions
 """
 
@@ -25,44 +25,30 @@ print("\n1. Loading hybrid transition models...")
 with open('hybrid_transition_models.pkl', 'rb') as f:
     models = pickle.load(f)
 
-model_d30 = models['model_d30']
-scaler_d30 = models['scaler_d30']
+model_d1_29 = models['model_d1_29']
+scaler_d1_29 = models['scaler_d1_29']
 model_prepay = models['model_prepay']
 scaler_prepay = models['scaler_prepay']
 transition_matrices = models['transition_matrices']
 programs = models['programs']
 term_buckets = models['term_buckets']
-feature_cols_d30 = models['feature_cols_d30']
+feature_cols_d1_29 = models['feature_cols_d1_29']
 feature_cols_prepay = models['feature_cols_prepay']
-numeric_features_d30 = models['numeric_features_d30']
+numeric_features_d1_29 = models['numeric_features_d1_29']
 numeric_features_prepay = models['numeric_features_prepay']
 
-print(f"  Loaded regression models (AUC D30: {models['auc_d30']:.3f}, Prepay: {models['auc_prepay']:.3f})")
+print(f"  Loaded regression models (AUC D1-29: {models['auc_d1_29']:.3f}, Payoff: {models['auc_prepay']:.3f})")
 print(f"  Loaded {len(transition_matrices)} empirical matrices (Program x Term)")
 print(f"  Programs: {programs}, Term buckets: {len(term_buckets)}")
 
-# Load loan data from enhanced dataset
+# Load loan data from enhanced dataset (now includes int_rate and mdr)
 print("  Loading loan_performance_enhanced.csv...")
 loan_perf = pd.read_csv('loan_performance_enhanced.csv')
 loan_perf['report_date'] = pd.to_datetime(loan_perf['report_date'])
 loan_perf['disbursement_d'] = pd.to_datetime(loan_perf['disbursement_d'])
 
 # Get the most recent snapshot of each loan for portfolio projection
-loan_tape_enhanced = loan_perf.sort_values('report_date').groupby('display_id').last().reset_index()
-
-# Load original loan tape for int_rate and mdr
-print("  Loading original loan tape for interest rates...")
-loan_tape_orig = pd.read_csv('loan tape - moore v1.0.csv')
-loan_tape_orig.columns = loan_tape_orig.columns.str.strip()
-loan_tape_orig['mdr'] = pd.to_numeric(loan_tape_orig['mdr'].str.rstrip('%'), errors='coerce') / 100
-loan_tape_orig['int_rate'] = pd.to_numeric(loan_tape_orig['int_rate'].str.rstrip('%'), errors='coerce') / 100
-
-# Merge enhanced data with original tape to get int_rate and mdr
-loan_tape = loan_tape_enhanced.merge(
-    loan_tape_orig[['display_id', 'int_rate', 'mdr']],
-    on='display_id',
-    how='left'
-)
+loan_tape = loan_perf.sort_values('report_date').groupby('display_id').last().reset_index()
 
 print(f"  Loaded {len(loan_tape):,} unique loans from enhanced dataset")
 
@@ -70,14 +56,14 @@ print(f"  Loaded {len(loan_tape):,} unique loans from enhanced dataset")
 # 2. HYBRID CASHFLOW PROJECTION FUNCTION
 # ============================================================================
 
-def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, scaler_prepay,
+def project_cashflows_hybrid(portfolio_df, model_d1_29, scaler_d1_29, model_prepay, scaler_prepay,
                              transition_matrices, programs, term_buckets,
-                             feature_cols_d30, feature_cols_prepay,
-                             numeric_features_d30, numeric_features_prepay,
-                             recovery_rate=0.15, months=60, stress_d30_mult=1.0, stress_co_mult=1.0):
+                             feature_cols_d1_29, feature_cols_prepay,
+                             numeric_features_d1_29, numeric_features_prepay,
+                             recovery_rate=0.15, months=60, stress_d1_29_mult=1.0, stress_co_mult=1.0):
     """
     Project cashflows using hybrid model:
-    - Regression for Current → D30 (full features) and Current → Prepay (simplified features)
+    - Regression for Current → D1-29 (full features) and Current → Payoff (simplified features)
     - Empirical Program x Term matrices for delinquency transitions
     """
 
@@ -169,50 +155,129 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
             # Prepare features for regression
             current_indices = np.where(current_mask)[0]
 
-            # Build feature matrix for D30+ model (full features)
-            d30_features = pd.DataFrame({
-                'fico_score': fico_scores[current_indices],
-                'approved_amount': portfolio_df['approved_amount'].values[current_indices],
-                'loan_term': portfolio_df['loan_term'].values[current_indices],
-                'loan_age_months': loan_ages[current_indices],
-                'upb': balances[current_indices],
-                'paid_principal': portfolio_df['paid_principal'].values[current_indices],
-                'paid_interest': portfolio_df['paid_interest'].values[current_indices],
-                'ever_D30': portfolio_df['ever_D30'].values[current_indices],
-                'ever_D60': portfolio_df['ever_D60'].values[current_indices],
-                'ever_D90': portfolio_df['ever_D90'].values[current_indices]
+            # Build feature matrix for D1-29 model (full features)
+            # Create age buckets with finer granularity in early months
+            def create_age_buckets(age_months):
+                if age_months <= 1:
+                    return '0-1m'
+                elif age_months <= 3:
+                    return '2-3m'
+                elif age_months <= 6:
+                    return '4-6m'
+                elif age_months <= 12:
+                    return '7-12m'
+                elif age_months <= 18:
+                    return '13-18m'
+                elif age_months <= 24:
+                    return '19-24m'
+                else:
+                    return '24m+'
+
+            age_buckets = np.array([create_age_buckets(age) for age in loan_ages[current_indices]])
+
+            # Create FICO buckets
+            def create_fico_buckets(fico):
+                if fico < 620:
+                    return 'fico_<620'
+                elif fico < 660:
+                    return 'fico_620-659'
+                elif fico < 700:
+                    return 'fico_660-699'
+                elif fico < 740:
+                    return 'fico_700-739'
+                else:
+                    return 'fico_740+'
+
+            # Create amount buckets
+            def create_amount_buckets(amount):
+                if amount <= 2000:
+                    return 'amt_0-2k'
+                elif amount <= 4000:
+                    return 'amt_2-4k'
+                elif amount <= 6000:
+                    return 'amt_4-6k'
+                elif amount <= 8000:
+                    return 'amt_6-8k'
+                else:
+                    return 'amt_8k+'
+
+            fico_buckets = np.array([create_fico_buckets(f) for f in fico_scores[current_indices]])
+            amount_buckets = np.array([create_amount_buckets(a) for a in portfolio_df['approved_amount'].values[current_indices]])
+            term_vals = portfolio_df['loan_term'].values[current_indices]
+
+            # Build feature matrix with all dummies
+            d1_29_features = pd.DataFrame({
+                'ever_D30': portfolio_df['ever_D30'].values[current_indices].astype(int)
             })
 
-            # Add program dummies for D30+ model
+            # Add program dummies for D1-29 model (drop first)
             program_vals = portfolio_df['program'].values[current_indices]
             for prog in ['P2', 'P3']:
-                d30_features[f'program_{prog}'] = (program_vals == prog).astype(int)
+                d1_29_features[f'program_{prog}'] = (program_vals == prog).astype(int)
 
-            # Ensure all D30+ feature columns exist
-            for col in feature_cols_d30:
-                if col not in d30_features.columns:
-                    d30_features[col] = 0
-            d30_features = d30_features[feature_cols_d30]
+            # Add age bucket dummies (drop first bucket '0-1m')
+            for bucket in ['2-3m', '4-6m', '7-12m', '13-18m', '19-24m', '24m+']:
+                d1_29_features[f'age_{bucket}'] = (age_buckets == bucket).astype(int)
 
-            # Build feature matrix for Prepay model (simplified: program, term, age only)
-            prepay_features = pd.DataFrame({
-                'loan_term': portfolio_df['loan_term'].values[current_indices],
-                'loan_age_months': loan_ages[current_indices]
-            })
+            # Add FICO bucket dummies (drop first '<620')
+            for bucket in ['fico_620-659', 'fico_660-699', 'fico_700-739', 'fico_740+']:
+                d1_29_features[f'{bucket}'] = (fico_buckets == bucket).astype(int)
 
-            # Add program dummies for Prepay model
+            # Add amount bucket dummies (drop first '0-2k')
+            for bucket in ['amt_2-4k', 'amt_4-6k', 'amt_6-8k', 'amt_8k+']:
+                d1_29_features[f'{bucket}'] = (amount_buckets == bucket).astype(int)
+
+            # Add loan term dummies (drop first term)
+            unique_terms = sorted(set(term_vals))
+            for term in unique_terms[1:]:  # Drop first term
+                d1_29_features[f'term_{term}'] = (term_vals == term).astype(int)
+
+            # Ensure all D1-29 feature columns exist
+            for col in feature_cols_d1_29:
+                if col not in d1_29_features.columns:
+                    d1_29_features[col] = 0
+            d1_29_features = d1_29_features[feature_cols_d1_29]
+
+            # Build feature matrix for Payoff model (all categorical: program, term dummies, age buckets, FICO buckets + time to maturity)
+            prepay_features = pd.DataFrame()
+
+            # Add program dummies for Payoff model (drop first)
             for prog in ['P2', 'P3']:
                 prepay_features[f'program_{prog}'] = (program_vals == prog).astype(int)
 
-            # Ensure all Prepay feature columns exist
+            # Add age bucket dummies (drop first bucket '0-1m')
+            age_bucket_list = ['2-3m', '4-6m', '7-12m', '13-18m', '19-24m', '24m+']
+            for bucket in age_bucket_list:
+                prepay_features[f'age_{bucket}'] = (age_buckets == bucket).astype(int)
+
+            # Add FICO bucket dummies (drop first '<620')
+            for bucket in ['fico_620-659', 'fico_660-699', 'fico_700-739', 'fico_740+']:
+                prepay_features[f'{bucket}'] = (fico_buckets == bucket).astype(int)
+
+            # Add loan term dummies (drop first term)
+            for term in unique_terms[1:]:  # Drop first term
+                prepay_features[f'term_{term}'] = (term_vals == term).astype(int)
+
+            # Add UPB bucket dummies (drop first bucket '0-1k')
+            # Create UPB buckets based on current balance
+            current_upbs = balances[current_indices]
+            upb_buckets = np.where(current_upbs <= 1000, 'upb_0-1k',
+                          np.where(current_upbs <= 2500, 'upb_1-2.5k',
+                          np.where(current_upbs <= 5000, 'upb_2.5-5k',
+                          np.where(current_upbs <= 7500, 'upb_5-7.5k', 'upb_7.5k+'))))
+
+            for bucket in ['upb_1-2.5k', 'upb_2.5-5k', 'upb_5-7.5k', 'upb_7.5k+']:
+                prepay_features[f'upb_{bucket}'] = (upb_buckets == bucket).astype(int)
+
+            # Ensure all Payoff feature columns exist
             for col in feature_cols_prepay:
                 if col not in prepay_features.columns:
                     prepay_features[col] = 0
             prepay_features = prepay_features[feature_cols_prepay]
 
             # Predict probabilities
-            X_scaled_d30 = scaler_d30.transform(d30_features)
-            prob_d30 = model_d30.predict_proba(X_scaled_d30)[:, 1] * stress_d30_mult
+            X_scaled_d1_29 = scaler_d1_29.transform(d1_29_features)
+            prob_d1_29 = model_d1_29.predict_proba(X_scaled_d1_29)[:, 1] * stress_d1_29_mult
 
             X_scaled_prepay = scaler_prepay.transform(prepay_features)
             prob_prepay = model_prepay.predict_proba(X_scaled_prepay)[:, 1]
@@ -220,14 +285,14 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
             # Determine outcomes
             rand = np.random.random(len(current_indices))
 
-            # Prepay first (higher priority)
+            # Payoff first (higher priority)
             prepay_mask = rand < prob_prepay
             new_states[current_indices[prepay_mask]] = 'PAID_OFF'
 
-            # Then delinquency (for those who didn't prepay)
+            # Then delinquency (for those who didn't pay off)
             remaining = ~prepay_mask
             rand2 = np.random.random(remaining.sum())
-            delq_mask = rand2 < prob_d30[remaining]
+            delq_mask = rand2 < prob_d1_29[remaining]
 
             remaining_indices = current_indices[remaining][delq_mask]
             new_states[remaining_indices] = 'D1_29'  # First bucket
@@ -321,7 +386,7 @@ def project_cashflows_hybrid(portfolio_df, model_d30, scaler_d30, model_prepay, 
             'month': month + 1,
             'interest': interest.sum(),
             'scheduled_principal': scheduled_principal.sum(),
-            'prepayments': payoff_amount.sum(),
+            'payoffs': payoff_amount.sum(),
             'defaults': chargeoff_amount.sum(),
             'recoveries': recovery_amount.sum(),
             'total_inflow': interest.sum() + scheduled_principal.sum() + payoff_amount.sum() + recovery_amount.sum(),
@@ -363,7 +428,7 @@ def calculate_returns(cashflows, initial_investment, leverage_ratio=0.0, cost_of
 
     for _, row in cashflows.iterrows():
         interest_expense = outstanding_debt * monthly_debt_rate
-        principal_collected = row['scheduled_principal'] + row['prepayments'] + row['recoveries']
+        principal_collected = row['scheduled_principal'] + row['payoffs'] + row['recoveries']
 
         debt_paydown = min(principal_collected, outstanding_debt)
         outstanding_debt -= debt_paydown
@@ -401,7 +466,9 @@ sample_size = min(10000, len(loan_tape))
 np.random.seed(42)
 
 # Filter for active loans only (exclude already charged off or paid off)
-active_loans = loan_tape[~loan_tape['delinquency_bucket'].isin(['PAID OFF', 'CHARGED OFF', 'SATISFIED', 'WRITTEN OFF'])]
+# active loans should be those upb>0 and as of Oct 2023
+# active_loans = loan_tape[~loan_tape['delinquency_bucket'].isin(['PAID OFF', 'CHARGED OFF', 'SATISFIED', 'WRITTEN_OFF'])]
+active_loans = loan_tape[(loan_tape['upb'] > 100) & (loan_tape['report_date'] >= '2023-10-01')]
 required_cols = ['approved_amount', 'int_rate', 'loan_term', 'fico_score', 'program',
                  'upb', 'paid_principal', 'paid_interest', 'ever_D30', 'ever_D60', 'ever_D90',
                  'delinquency_bucket', 'loan_age_months']
@@ -427,9 +494,9 @@ print(f"  Current UPB: ${initial_value:,.0f}")
 print(f"  Original Amount: ${portfolio_sample['approved_amount'].sum():,.0f}")
 
 scenarios = {
-    'Base Case': {'stress_d30': 1.0, 'stress_co': 1.0, 'recovery': 0.15},
-    'Moderate Stress': {'stress_d30': 1.3, 'stress_co': 1.5, 'recovery': 0.12},
-    'Severe Stress': {'stress_d30': 1.6, 'stress_co': 2.5, 'recovery': 0.08}
+    'Base Case': {'stress_d1_29': 1.0, 'stress_co': 1.0, 'recovery': 0},
+    'Moderate Stress': {'stress_d1_29': 1.2, 'stress_co': 1.5, 'recovery': 0},
+    'Severe Stress': {'stress_d1_29': 1.6, 'stress_co': 2.5, 'recovery': 0}
 }
 
 results = {}
@@ -437,16 +504,16 @@ cashflow_results = {}
 
 for scenario_name, params in scenarios.items():
     print(f"\n  {scenario_name}:")
-    print(f"    D30 stress: {params['stress_d30']:.1f}x, CO stress: {params['stress_co']:.1f}x, Recovery: {params['recovery']*100:.0f}%")
+    print(f"    D1-29 stress: {params['stress_d1_29']:.1f}x, CO stress: {params['stress_co']:.1f}x, Recovery: {params['recovery']*100:.0f}%")
 
     np.random.seed(42)
     cf = project_cashflows_hybrid(
-        portfolio_sample, model_d30, scaler_d30, model_prepay, scaler_prepay,
+        portfolio_sample, model_d1_29, scaler_d1_29, model_prepay, scaler_prepay,
         transition_matrices, programs, term_buckets,
-        feature_cols_d30, feature_cols_prepay,
-        numeric_features_d30, numeric_features_prepay,
+        feature_cols_d1_29, feature_cols_prepay,
+        numeric_features_d1_29, numeric_features_prepay,
         recovery_rate=params['recovery'],
-        stress_d30_mult=params['stress_d30'],
+        stress_d1_29_mult=params['stress_d1_29'],
         stress_co_mult=params['stress_co']
     )
 
@@ -475,6 +542,7 @@ for scenario_name in scenarios.keys():
 
     summary_data.append({
         'Scenario': scenario_name,
+        'investment ($)': f"${unlev['portfolio_value']/1e6:.2f}M",
         'Unlevered IRR': f"{unlev['irr']*100:.1f}%",
         'Unlevered MOIC': f"{unlev['moic']:.2f}x",
         'Levered IRR': f"{lev['irr']*100:.1f}%",
@@ -491,6 +559,83 @@ with open('hybrid_cashflow_results.pkl', 'wb') as f:
     pickle.dump({'results': results, 'cashflows': cashflow_results, 'summary': summary_df}, f)
 
 print("\n  Results saved to hybrid_cashflow_results.pkl")
+
+# ============================================================================
+# 6. CASHFLOW VISUALIZATION - STACKED COLUMN CHARTS
+# ============================================================================
+print("\n3. Creating cashflow visualizations...")
+
+import matplotlib.pyplot as plt
+
+# Create a combined comparison chart (all scenarios side-by-side)
+n_scenarios = len(scenarios)
+fig, axes = plt.subplots(1, n_scenarios, figsize=(20, 7))
+if n_scenarios == 1:
+    axes = [axes]
+
+for idx, (scenario_name, cf) in enumerate(cashflow_results.items()):
+    ax = axes[idx]
+
+    months = cf['month'].values
+    interest_payments = cf['interest'].values
+    principal_payments = cf['scheduled_principal'].values
+    payoffs = cf['payoffs'].values
+    defaults = cf['defaults'].values
+
+    # Calculate totals
+    total_principal = principal_payments.sum()
+    total_interest = interest_payments.sum()
+    total_payoff = payoffs.sum()
+    total_default = defaults.sum()
+    total_gross_cf = total_principal + total_interest + total_payoff
+    total_net_cf = total_gross_cf - total_default
+    moic = total_net_cf / initial_value
+
+    # Stacked bars
+    ax.bar(months, interest_payments, label='Interest', color='forestgreen', alpha=0.8)
+    ax.bar(months, principal_payments, bottom=interest_payments,
+           label='Principal', color='steelblue', alpha=0.8)
+    ax.bar(months, payoffs, bottom=interest_payments + principal_payments,
+           label='Payoff', color='orange', alpha=0.8)
+    ax.bar(months, -defaults, label='Default', color='crimson', alpha=0.8)
+
+    # Add text box with totals (including initial investment, net CF, and MOIC)
+    textstr = f'Initial Inv: ${initial_value/1e6:.2f}M\n'
+    textstr += f'─────────────────────\n'
+    textstr += f'Principal: ${total_principal/1e6:.2f}M\n'
+    textstr += f'Interest: ${total_interest/1e6:.2f}M\n'
+    textstr += f'Payoff: ${total_payoff/1e6:.2f}M\n'
+    textstr += f'Default: ${total_default/1e6:.2f}M\n'
+    textstr += f'─────────────────────\n'
+    textstr += f'Net CF: ${total_net_cf/1e6:.2f}M\n'
+    textstr += f'MOIC: {moic:.2f}x'
+
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.85)
+    ax.text(0.98, 0.97, textstr, transform=ax.transAxes, fontsize=9,
+            verticalalignment='top', horizontalalignment='right', bbox=props, family='monospace')
+
+    ax.set_xlabel('Month', fontsize=10, fontweight='bold')
+    ax.set_ylabel('Cashflow ($)', fontsize=10, fontweight='bold')
+    ax.set_title(scenario_name, fontsize=12, fontweight='bold')
+    if idx == 0:
+        # Create custom legend with colored markers
+        from matplotlib.patches import Rectangle
+        legend_elements = [
+            Rectangle((0, 0), 1, 1, fc='forestgreen', alpha=0.8, label='Interest'),
+            Rectangle((0, 0), 1, 1, fc='steelblue', alpha=0.8, label='Principal'),
+            Rectangle((0, 0), 1, 1, fc='orange', alpha=0.8, label='Payoff'),
+            Rectangle((0, 0), 1, 1, fc='crimson', alpha=0.8, label='Default')
+        ]
+        ax.legend(handles=legend_elements, fontsize=9, loc='upper left', framealpha=0.9)
+    ax.grid(alpha=0.3, axis='y')
+    ax.axhline(y=0, color='black', linewidth=0.8, linestyle='-')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x/1e6:.1f}M'))
+
+fig.suptitle('Cashflow Breakdown Comparison - All Scenarios', fontsize=16, fontweight='bold', y=0.98)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig('cashflow_breakdown_comparison.png', dpi=150, bbox_inches='tight')
+print("  ✓ Saved cashflow_breakdown_comparison.png")
+plt.close()
 
 print("\n" + "="*80)
 print("HYBRID CASHFLOW ANALYSIS COMPLETE")

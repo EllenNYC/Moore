@@ -690,8 +690,9 @@ html_content += f"""
         <div class="methodology">
             <p>Cashflows are projected month-by-month over a 60-month horizon:</p>
             <ul>
-                <li><strong>Portfolio:</strong> 10,000 outstanding loans sampled from portfolio as of October 2023 (active loans only, excluding paid-off and charged-off loans)</li>
-                <li><strong>Starting Point:</strong> Current UPB (unpaid principal balance) as of portfolio date</li>
+                <li><strong>Portfolio:</strong> 8,141 active loans from 2023Q3 origination cohort (July-September 2023), observed as of October 2023</li>
+                <li><strong>Vintage Cohort:</strong> Focus on most recent origination quarter to eliminate vintage effects and provide forward-looking analysis</li>
+                <li><strong>Starting Point:</strong> Current UPB (unpaid principal balance) as of October 2023 reporting date</li>
                 <li><strong>Projection Horizon:</strong> 60 months forward</li>
                 <li><strong>Monthly Process:</strong>
                     <ol>

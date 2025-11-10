@@ -785,7 +785,7 @@ html_content += f"""
 
         <h3>5.1 Model Strengths</h3>
         <ul>
-            <li><strong>Hybrid Approach:</strong> Combines predictive power of machine learning with stability of empirical matrices</li>
+            <li><strong>Hybrid Approach:</strong> Combines predictive power of logistic regression models with stability of empirical transition matrices</li>
             <li><strong>Strong Validation:</strong> Models show good out-of-sample performance across multiple dimensions</li>
             <li><strong>Granular Segmentation:</strong> Program × Term matrices capture heterogeneity in portfolio behavior</li>
             <li><strong>Interpretability:</strong> Feature coefficients provide clear economic intuition (e.g., high FICO reduces delinquency)</li>
@@ -796,7 +796,6 @@ html_content += f"""
             <li><strong>Attractive Risk-Adjusted Returns:</strong> Base case unlevered IRR of {cashflow_results['Base Case']['unlevered']['irr']*100:.1f}% with {cashflow_results['Base Case']['unlevered']['wal_years']:.1f}y WAL</li>
             <li><strong>Leverage Opportunity:</strong> 85% LTV financing enhances equity returns to {cashflow_results['Base Case']['levered']['irr']*100:.1f}% in base case</li>
             <li><strong>Portfolio Quality:</strong> Average FICO of {portfolio['fico_score'].mean():.0f} with manageable current delinquency levels</li>
-            <li><strong>Diversification:</strong> Spread across 3 programs and multiple term structures reduces concentration risk</li>
         </ul>
 
         <h3>5.3 Risk Considerations</h3>
@@ -812,7 +811,6 @@ html_content += f"""
             <ol>
                 <li><strong>Proceed with Investment:</strong> Base case economics support investment at current pricing</li>
                 <li><strong>Monitor Delinquency Triggers:</strong> Implement early warning system for D1-29 entry rate increases</li>
-                <li><strong>Optimize Leverage:</strong> Consider reducing LTV to 70-75% to improve stress performance</li>
                 <li><strong>Portfolio Hedging:</strong> Evaluate credit protection strategies for tail risk scenarios</li>
                 <li><strong>Model Refresh:</strong> Update transition matrices quarterly as new data becomes available</li>
             </ol>

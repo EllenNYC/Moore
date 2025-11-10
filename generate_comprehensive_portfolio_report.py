@@ -854,30 +854,31 @@ html_content += f"""
 
         <h3>A.4 Model Features & Coefficients</h3>
 
-        <h4>D1-29 Early Delinquency Model (22 features)</h4>
+        <h4>D1-29 Early Delinquency Model (22 features - All Categorical)</h4>
         <p><strong>Feature Categories:</strong></p>
         <ul>
-            <li><strong>FICO Buckets (4):</strong> fico_620-659, fico_660-699, fico_700-739, fico_740+ (baseline: <620)</li>
-            <li><strong>Loan Amount Buckets (4):</strong> amount_1000-2500, amount_2500-5000, amount_5000-10000, amount_10000+ (baseline: <1000)</li>
-            <li><strong>Age Buckets (6):</strong> age_2-3m, age_4-6m, age_7-12m, age_13-18m, age_19-24m, age_25+ (baseline: 0-1m)</li>
+            <li><strong>Program Dummies (2):</strong> program_P2, program_P3 (baseline: P1)</li>
+            <li><strong>FICO Buckets (4):</strong> fico_<620, fico_660-699, fico_700-739, fico_740+ (baseline: fico_620-659)</li>
+            <li><strong>Loan Amount Buckets (4):</strong> amt_2-4k, amt_4-6k, amt_6-8k, amt_8k+ (baseline: amt_<2k)</li>
+            <li><strong>Age Buckets (6):</strong> age_2-3m, age_4-6m, age_7-12m, age_13-18m, age_19-24m, age_24m+ (baseline: age_0-1m)</li>
             <li><strong>Term Dummies (5):</strong> term_6, term_12, term_24, term_36, term_60 (baseline: term_3)</li>
-            <li><strong>Numeric Features (2):</strong> upb (current outstanding balance), total_payments (cumulative payments made)</li>
             <li><strong>Delinquency History (1):</strong> ever_D30 (flag for prior 30+ DPD)</li>
         </ul>
 
         <p><strong>Top Positive Coefficients (increase delinquency risk):</strong></p>
         <ul>
-            <li>Lower FICO scores (baseline <620 vs. 740+: +0.78 coefficient difference)</li>
-            <li>Smaller loan amounts (baseline <1000 vs. 10000+: positive coefficient)</li>
-            <li>Longer terms (60-month loans show higher early delinquency risk)</li>
-            <li>Prior delinquency history (ever_D30 flag)</li>
+            <li><strong>Low FICO (<620):</strong> +0.18 (subprime borrowers show higher delinquency risk)</li>
+            <li><strong>Program P3:</strong> +0.14 (subprime program shows elevated early delinquency)</li>
+            <li><strong>Prior Delinquency (ever_D30):</strong> +0.13 (history of 30+ DPD predicts future delinquency)</li>
+            <li><strong>Higher Loan Amounts:</strong> Larger loans (4k-8k+) show slightly higher early delinquency risk</li>
         </ul>
 
         <p><strong>Top Negative Coefficients (reduce delinquency risk):</strong></p>
         <ul>
-            <li>High FICO (740+): -0.78</li>
-            <li>Mid-age loans (7-12 months): -0.51 (seasoned but not near maturity)</li>
-            <li>Higher total payments made (indicates payment consistency)</li>
+            <li><strong>High FICO (740+):</strong> -0.78 (prime borrowers least likely to become delinquent)</li>
+            <li><strong>Mid-Age Loans (7-12m):</strong> -0.51 (seasoned loans past early payment shock period)</li>
+            <li><strong>Good FICO (700-739):</strong> -0.33 (near-prime borrowers show strong payment performance)</li>
+            <li><strong>Loan Age (4-6m, 2-3m):</strong> -0.48, -0.33 (loans that survive first month show lower delinquency risk)</li>
         </ul>
 
         <h4>Payoff Model (21 features - All Categorical)</h4>
